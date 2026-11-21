@@ -64,11 +64,12 @@ cp "$LOCK" "$BUNDLE/runtime.lock.toml"
 # The upstream build output is what makes the bundle self-contained. Node is the
 # one host dependency and is documented in the README; nothing is fetched here.
 
-for path in apps packages node_modules package.json pnpm-lock.yaml; do
+for path in apps packages vendor node_modules package.json pnpm-lock.yaml; do
     [[ -e "$SUBMODULE/$path" ]] || continue
     mkdir -p "$BUNDLE/runtime"
     cp -R "$SUBMODULE/$path" "$BUNDLE/runtime/"
 done
+cp "$ROOT/runtime/host.mjs" "$BUNDLE/runtime/host.mjs"
 
 {
     echo "product_version=$VERSION"

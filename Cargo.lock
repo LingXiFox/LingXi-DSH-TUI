@@ -209,6 +209,7 @@ dependencies = [
  "dsh-protocol",
  "dsh-state",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

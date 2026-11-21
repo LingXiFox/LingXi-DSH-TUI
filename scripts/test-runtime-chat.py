@@ -297,21 +297,92 @@ def exercise(binary, root, work, server):
         thread.join()
 
 
+def verify_ecosystem(binary, root, work, runtime):
+    shared = root / ".dsh-tui/agent"
+    home = root / "snapshot"
+    home.mkdir()
+    env = dict(os.environ, DSH_TUI_UPSTREAM=str(runtime), DSH_TUI_ROOT=str(root),
+               DSH_TUI_DSH_HOME=str(shared), DEEPSEEK_API_KEY="local-fixture",
+               DEEPSEEK_BASE_URL="http://127.0.0.1:9")
+    adapter = (root / "runtime/host.mjs").resolve(strict=True)
+    rows = json.loads(subprocess.check_output(
+        ["node", adapter, "history", home, shared], env=env, timeout=15))
+    row, = rows
+    assert row["current"] and Path(row["cwd"]) == work.resolve()
+    source, = (path for path in (shared / "sessions").rglob("session.v4.jsonl.zstd")
+               if row["id"] in path.parts)
+    source_before = source.read_bytes()
+    journal = home / "history.ndjson"
+    subprocess.run(["node", adapter, "stage", home, shared, row["id"], journal],
+                   env=env, check=True, timeout=15)
+    assert "Confirmed response 2" in journal.read_text()
+    snapshot, = home.rglob("session.v4.jsonl.zstd")
+    assert snapshot.read_bytes() == source_before == source.read_bytes()
+    process, terminal = pty.fork()
+    if process == 0:
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+        os.chdir(work)
+        os.execve(binary, [str(binary), "--history"], dict(env, TERM="xterm-256color"))
+    output = bytearray()
+    exited = False
+
+    def expect(text, *, raw=False):
+        def matches():
+            return text.encode() in output if raw else text in screen_text(output)
+
+        deadline = time.monotonic() + 15
+        while not matches():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([terminal], [], [], remaining)[0]:
+                raise AssertionError(f"Ecosystem terminal did not show {text!r}")
+            output.extend(os.read(terminal, 65536))
+
+    try:
+        expect("ready")
+        expect(row["id"])
+        os.write(terminal, b"\r")
+        expect("Session resumed")
+        expect("Test child session")
+        inventory_path, = (root / ".dsh-tui").glob("ecosystem-*/lingxi-inventory.json")
+        inventory = json.loads(inventory_path.read_text())
+        assert any(provider["id"] == "deepseek-official" for provider in inventory["providers"])
+        assert inventory["plugins"] and "skills" in inventory and inventory["mcp"] == []
+        os.write(terminal, b"\x10/quit\r")
+        expect("\x1b[?1049l", raw=True)
+        _, status = os.waitpid(process, 0)
+        exited = True
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        if not exited:
+            try:
+                os.killpg(process, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(process, 0)
+        os.close(terminal)
+    assert source.read_bytes() == source_before
+    print("Official ecosystem: inventory and isolated current-format history snapshot passed")
+
+
 def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "target/debug/dsh-tui").resolve(strict=True)
     runtime = (ROOT / "runtime/upstream").resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="dsh-runtime-chat-") as tmp:
-        work = Path(tmp) / "workspace"
+        tmp = Path(tmp).resolve()
+        work = tmp / "workspace"
         work.mkdir()
         (work / "fixture.txt").write_text(FILE_TEXT + "\n", encoding="utf-8")
-        root = Path(tmp) / "bundle"
+        root = tmp / "bundle"
         root.mkdir()
-        (root / "runtime").symlink_to(runtime, target_is_directory=True)
-        (root / "runtime.lock.toml").symlink_to(ROOT / "runtime/upstream.lock.toml")
+        (root / "runtime").mkdir()
+        (root / "runtime/upstream").symlink_to(runtime, target_is_directory=True)
+        (root / "runtime/upstream.lock.toml").symlink_to(ROOT / "runtime/upstream.lock.toml")
+        (root / "runtime/host.mjs").symlink_to(ROOT / "runtime/host.mjs")
         with http.server.HTTPServer(("127.0.0.1", 0), Provider) as server:
             server.requests = []
             try:
                 exercise(binary, root, work, server)
+                verify_ecosystem(binary, root, work, runtime)
             except Exception:
                 log = root / ".dsh-tui/runtime.log"
                 if log.exists():

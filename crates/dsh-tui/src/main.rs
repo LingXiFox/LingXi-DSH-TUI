@@ -30,7 +30,7 @@ async fn main() -> std::process::ExitCode {
     }
     if matches!(args.as_slice(), [arg] if arg == "--help" || arg == "-h") {
         println!(
-            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime | --replay-journal FILE]\n\n  --check-runtime       verify bundled SDK initialization and shutdown\n  --replay-journal FILE view one exported session without starting the SDK\n  Ctrl+P                command palette\n  Ctrl+J                insert newline\n  /quit                 quit",
+            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime | --history | --replay-journal FILE]\n\n  --check-runtime       verify bundled SDK initialization and shutdown\n  --history             open the history picker on startup\n  --replay-journal FILE view one exported session without starting the SDK\n  Ctrl+P                command palette\n  Ctrl+J                insert newline\n  /quit                 quit",
             build_info::VERSION
         );
         return std::process::ExitCode::SUCCESS;
@@ -47,6 +47,7 @@ async fn main() -> std::process::ExitCode {
     }
     let replay = match args.as_slice() {
         [] => None,
+        [flag] if flag == "--history" => None,
         [flag, path] if flag == "--replay-journal" => Some(PathBuf::from(path)),
         _ => {
             eprintln!("invalid arguments; see dsh-tui --help");
@@ -68,7 +69,7 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    match app::run(state, replay).await {
+    match app::run(state, replay, args.as_slice() == ["--history"]).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("dsh-tui failed: {error}");

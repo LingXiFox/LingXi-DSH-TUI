@@ -2,6 +2,7 @@
 
 mod interaction;
 
+use std::collections::HashSet;
 use std::future::pending;
 use std::hash::{BuildHasher, RandomState};
 use std::io;
@@ -34,16 +35,169 @@ enum Operation {
     Prompt(String),
     Wait,
     Resume(String),
-    Cwd,
+    Cwd(bool),
 }
 
 enum Overlay {
     Help,
     Commands(Draft),
-    History {
-        sessions: Option<Vec<String>>,
-        selected: usize,
-    },
+    History { picker: Picker },
+    Inventory(Picker),
+}
+
+#[derive(Clone)]
+enum PickAction {
+    Local(String),
+    Official(String),
+    Route(String, String),
+    Skill(String),
+    None,
+}
+
+struct Picker {
+    title: &'static str,
+    rows: Option<Vec<(String, PickAction)>>,
+    query: Draft,
+    selected: usize,
+}
+
+impl Picker {
+    fn new(title: &'static str, rows: Option<Vec<(String, PickAction)>>) -> Self {
+        Self {
+            title,
+            rows,
+            query: Draft::default(),
+            selected: 0,
+        }
+    }
+
+    fn matches(&self) -> impl Iterator<Item = &(String, PickAction)> {
+        let query = self.query.text().to_lowercase();
+        self.rows
+            .iter()
+            .flatten()
+            .filter(move |(label, _)| label.to_lowercase().contains(&query))
+    }
+
+    fn modal(&self) -> Modal<'_> {
+        let body = if self.rows.is_none() {
+            "Reading session index…".into()
+        } else {
+            let start = self.selected.saturating_sub(3);
+            let rows = self
+                .matches()
+                .enumerate()
+                .skip(start)
+                .take(5)
+                .map(|(index, (label, _))| {
+                    format!("{} {label}", if index == self.selected { "›" } else { " " })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if rows.is_empty() {
+                "No matching entries".into()
+            } else {
+                rows
+            }
+        };
+        Modal {
+            title: self.title,
+            body: format!("Type to filter · ↑/↓ select · Enter opens · Esc closes\n{body}"),
+            input: Some(&self.query),
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent) -> Option<PickAction> {
+        match key.code {
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => {
+                self.selected = (self.selected + 1).min(self.matches().count().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                return self
+                    .matches()
+                    .nth(self.selected)
+                    .map(|(_, action)| action.clone());
+            }
+            _ => {
+                if self.query.text().len() < 256 || !matches!(key.code, KeyCode::Char(_)) {
+                    edit_key(&mut self.query, key, false);
+                }
+                self.selected = 0;
+            }
+        }
+        None
+    }
+}
+
+type HistoryResult = io::Result<Vec<(String, PickAction)>>;
+type StageResult = (String, io::Result<PathBuf>);
+
+fn inventory_rows(kind: &str, inventory: &Value) -> (&'static str, Vec<(String, PickAction)>) {
+    let values = |key: &str| inventory[key].as_array().into_iter().flatten();
+    let string = |value: &Value, key: &str| value[key].as_str().unwrap_or_default().to_owned();
+    match kind {
+        "models" => {
+            let mut rows = Vec::new();
+            for provider in values("providers") {
+                let id = string(provider, "id");
+                let name = string(provider, "name");
+                let models = provider["models"].as_array().into_iter().flatten();
+                if models.clone().next().is_none() {
+                    rows.push((
+                        format!("{name} ({id}) · no discoverable models"),
+                        PickAction::None,
+                    ));
+                }
+                for model in models {
+                    let model = string(model, "id");
+                    rows.push((
+                        format!("{id} / {model}"),
+                        PickAction::Route(id.clone(), model),
+                    ));
+                }
+            }
+            (" Provider / Model ", rows)
+        }
+        "plugins" => (
+            " Official Plugins ",
+            values("plugins")
+                .map(|entry| {
+                    let phase = entry["phase"].as_str().unwrap_or("inactive");
+                    (
+                        format!("{} · {phase}", string(entry, "name")),
+                        PickAction::None,
+                    )
+                })
+                .collect(),
+        ),
+        "skills" => (
+            " Official Skills ",
+            values("skills")
+                .map(|entry| {
+                    let name = string(entry, "name");
+                    let label = format!("{name} · {}", string(entry, "source"));
+                    let action = if entry["userInvocable"].as_bool() == Some(true) {
+                        PickAction::Skill(name)
+                    } else {
+                        PickAction::None
+                    };
+                    (label, action)
+                })
+                .collect(),
+        ),
+        _ => (
+            " Official MCP ",
+            values("mcp")
+                .map(|entry| {
+                    (
+                        format!("{} · {}", string(entry, "name"), string(entry, "state")),
+                        PickAction::None,
+                    )
+                })
+                .collect(),
+        ),
+    }
 }
 
 struct App {
@@ -57,7 +211,8 @@ struct App {
     config: Option<RuntimeConfig>,
     runtime: Option<RuntimeHandle>,
     operation: Option<(Operation, RpcResult)>,
-    history: Option<tokio::task::JoinHandle<io::Result<Vec<String>>>>,
+    history: Option<tokio::task::JoinHandle<HistoryResult>>,
+    staging: Option<tokio::task::JoinHandle<StageResult>>,
     interactions: Vec<Interaction>,
     overlay: Option<Overlay>,
     status: String,
@@ -65,6 +220,7 @@ struct App {
     route: String,
     version: String,
     attached: bool,
+    opened: HashSet<String>,
     resume_on_ready: bool,
     alt_newline: bool,
     quit: bool,
@@ -90,6 +246,7 @@ impl App {
             runtime: None,
             operation: None,
             history: None,
+            staging: None,
             interactions: Vec::new(),
             overlay: None,
             status: String::new(),
@@ -97,6 +254,7 @@ impl App {
             route: String::new(),
             version,
             attached: false,
+            opened: HashSet::new(),
             resume_on_ready: false,
             alt_newline: std::env::var("DSH_TUI_NEWLINE").as_deref() == Ok("alt-enter"),
             quit: false,
@@ -112,6 +270,7 @@ impl App {
     }
 
     fn start(&mut self, config: RuntimeConfig) {
+        self.opened.clear();
         self.cwd = config.cwd.to_string_lossy().into_owned();
         self.route = format!("{} / {}", config.provider, config.model);
         self.config = Some(config.clone());
@@ -153,25 +312,11 @@ impl App {
                 body: if self.offline {
                     "/failure   /help   /quit\nOffline: Agent and tools are disabled."
                 } else {
-                    "/new   /history   /resume ID   /cwd   /route PROVIDER MODEL\n/view ID   /back   /failure   /draft   /help   /quit\nType a command and press Enter."
+                    "/models   /history   /plugins   /skills   /mcp\n/new   /resume ID   /cwd   /route PROVIDER MODEL\n/reload   /view ID   /back   /failure   /draft   /help   /quit"
                 }.into(),
                 input: Some(input),
             }),
-            Some(Overlay::History { sessions, selected }) => Some(Modal {
-                title: " Local Host History ",
-                body: match sessions {
-                    None => "Reading local archives · Esc closes".into(),
-                    Some(sessions) if sessions.is_empty() => "No archived TUI sessions yet".into(),
-                    Some(sessions) => {
-                        let start = selected.saturating_sub(5);
-                        let rows = sessions.iter().enumerate().skip(start).take(7).map(|(index, id)| {
-                            format!("{} {id}", if index == *selected { ">" } else { " " })
-                        }).collect::<Vec<_>>().join("\n");
-                        format!("↑/↓ select · Enter resumes · Esc closes\n{rows}")
-                    }
-                },
-                input: None,
-            }),
+            Some(Overlay::History { picker } | Overlay::Inventory(picker)) => Some(picker.modal()),
             None => None,
         });
         let screen = Screen {
@@ -222,7 +367,7 @@ impl App {
             self.status = "Offline replay · prompts are disabled".into();
             return;
         }
-        if self.draft.text().trim().is_empty() || self.busy() {
+        if self.draft.text().trim().is_empty() || self.busy() || self.staging.is_some() {
             return;
         }
         let prompt = self.draft.text().to_owned();
@@ -258,6 +403,7 @@ impl App {
         let result = result.and_then(Response::decode_result::<Value>);
         match (operation, result) {
             (Operation::Prompt(_), Ok(result)) if result["messageId"].is_string() => {
+                self.opened.insert(self.session.clone());
                 self.attached = true;
                 self.status = "Agent running".into();
                 if let Err(error) = self.call(
@@ -287,18 +433,17 @@ impl App {
                 self.status = "Turn finished".into();
             }
             (Operation::Wait, Err(error)) => self.status = error,
-            (Operation::Resume(id), Ok(_)) => {
-                self.session = id;
-                self.attached = true;
-                self.viewed = None;
-                self.viewport.reset();
-                self.status = "Session resumed".into();
-            }
-            (Operation::Cwd, Ok(result)) => {
+            (Operation::Resume(id), Ok(_)) => self.select_session(id),
+            (Operation::Cwd(verbose), Ok(result)) => {
                 if let Some(cwd) = result["cwd"].as_str() {
                     self.cwd = cwd.into();
                     self.attached = true;
-                    self.status = format!("Session directory · {cwd}");
+                    self.opened.insert(self.session.clone());
+                    if verbose {
+                        self.status = format!("Session directory · {cwd}");
+                    } else {
+                        self.status = "Session resumed".into();
+                    }
                 } else {
                     self.status = "SDK returned no working directory".into();
                 }
@@ -410,6 +555,10 @@ impl App {
             self.status = format!("History replay failed: {error}");
             return;
         }
+        if self.opened.contains(&id) {
+            self.select_session(id);
+            return;
+        }
         if let Err(error) = self.call(
             Operation::Resume(id.clone()),
             ClientMethod::SessionResume,
@@ -417,6 +566,136 @@ impl App {
             REQUEST_TIMEOUT,
         ) {
             self.status = error;
+        }
+    }
+
+    fn select_session(&mut self, id: String) {
+        self.opened.insert(id.clone());
+        self.session = id;
+        self.attached = true;
+        self.viewed = None;
+        self.viewport.reset();
+        self.status = "Reading session directory…".into();
+        if let Err(error) = self.call(
+            Operation::Cwd(false),
+            ClientMethod::SessionWorkingDirectoryGet,
+            session_params(&self.session),
+            REQUEST_TIMEOUT,
+        ) {
+            self.status = error;
+        }
+    }
+
+    fn open_history(&mut self) {
+        let ecosystem = self
+            .config
+            .as_ref()
+            .and_then(RuntimeConfig::ecosystem)
+            .cloned();
+        let local = self.conversation.history();
+        let title = if ecosystem.is_some() {
+            " DSH History "
+        } else {
+            " Local Host History "
+        };
+        self.overlay = Some(Overlay::History {
+            picker: Picker::new(title, None),
+        });
+        if self.history.is_some() {
+            return;
+        }
+        self.history = Some(tokio::task::spawn_blocking(move || {
+            let mut rows = Vec::new();
+            if let Some(ecosystem) = ecosystem {
+                for session in ecosystem.history()? {
+                    let label = format!(
+                        "{}  {}  {}{}",
+                        session.date,
+                        session.id,
+                        session.cwd,
+                        if session.current {
+                            ""
+                        } else {
+                            " · older format"
+                        }
+                    );
+                    let action = if session.current {
+                        PickAction::Official(session.id)
+                    } else {
+                        PickAction::None
+                    };
+                    rows.push((label, action));
+                }
+            }
+            for id in local?.sessions()? {
+                if !rows.iter().any(
+                    |(_, action)| matches!(action, PickAction::Official(found) if *found == id),
+                ) {
+                    rows.push((format!("{id}  · TUI"), PickAction::Local(id)));
+                }
+            }
+            Ok(rows)
+        }));
+    }
+
+    fn open_inventory(&mut self, kind: &str) {
+        let Some(config) = &self.config else { return };
+        let Some(ecosystem) = config.ecosystem() else {
+            self.status = "Set DSH_TUI_DSH_HOME to use the official inventory".into();
+            return;
+        };
+        let Ok(inventory) = ecosystem.inventory() else {
+            self.status =
+                "Official inventory is loading or unavailable · retry after the SDK is ready"
+                    .into();
+            return;
+        };
+        let (title, mut rows) = inventory_rows(kind, &inventory);
+        if kind == "models" && !rows.iter().any(|(_, action)| matches!(action, PickAction::Route(p, m) if *p == config.provider && *m == config.model)) {
+            rows.insert(0, (format!("{} / {} · current", config.provider, config.model), PickAction::Route(config.provider.clone(), config.model.clone())));
+        }
+        self.overlay = Some(Overlay::Inventory(Picker::new(title, Some(rows))));
+    }
+
+    async fn pick(&mut self, action: PickAction) {
+        if matches!(action, PickAction::None) {
+            return;
+        }
+        if self.busy() || self.operation.is_some() || self.staging.is_some() {
+            self.status = "Finish the active request first".into();
+            return;
+        }
+        self.overlay = None;
+        match action {
+            PickAction::Local(id) => self.resume(id),
+            PickAction::Official(id) => {
+                if let Some(ecosystem) = self
+                    .config
+                    .as_ref()
+                    .and_then(RuntimeConfig::ecosystem)
+                    .cloned()
+                {
+                    self.status = "Reading official session snapshot…".into();
+                    self.staging = Some(tokio::task::spawn_blocking(move || {
+                        let result = ecosystem.stage(&id);
+                        (id, result)
+                    }));
+                }
+            }
+            PickAction::Route(provider, model) => {
+                if let Some(mut config) = self.config.clone() {
+                    if config.provider != provider || config.model != model {
+                        config.provider = provider;
+                        config.model = model;
+                        self.restart(config, false).await;
+                    }
+                }
+            }
+            PickAction::Skill(name) => {
+                self.viewport.focused = false;
+                self.draft.replace(format!("/{name} "));
+            }
+            PickAction::None => (),
         }
     }
 
@@ -445,35 +724,29 @@ impl App {
                 self.viewed = None;
                 self.viewport.reset();
             }
-            ["/new" | "/history" | "/resume" | "/route", ..]
-                if self.busy() || self.operation.is_some() =>
+            ["/new" | "/history" | "/resume" | "/route" | "/reload", ..]
+                if self.busy() || self.operation.is_some() || self.staging.is_some() =>
             {
                 self.status = "Finish or interrupt the active request first".into();
             }
             ["/new"] => {
                 self.session = new_session();
                 self.attached = false;
+                if let Some(config) = &self.config {
+                    self.cwd = config.cwd.to_string_lossy().into_owned();
+                }
                 self.viewed = None;
                 self.viewport.reset();
                 self.status = "New session".into();
             }
             ["/resume", id] => self.resume((*id).into()),
-            ["/history"] => match self.conversation.history() {
-                Ok(history) => {
-                    if self.history.is_none() {
-                        self.history =
-                            Some(tokio::task::spawn_blocking(move || history.sessions()));
-                    }
-                    self.overlay = Some(Overlay::History {
-                        sessions: None,
-                        selected: 0,
-                    })
-                }
-                Err(error) => self.status = format!("History scan failed: {error}"),
-            },
+            ["/history"] => self.open_history(),
+            [kind @ ("/models" | "/plugins" | "/skills" | "/mcp")] => {
+                self.open_inventory(&kind[1..])
+            }
             ["/cwd"] => {
                 if let Err(error) = self.call(
-                    Operation::Cwd,
+                    Operation::Cwd(true),
                     ClientMethod::SessionWorkingDirectoryGet,
                     session_params(&self.session),
                     REQUEST_TIMEOUT,
@@ -485,6 +758,11 @@ impl App {
                 if let Some(mut config) = self.config.clone() {
                     config.provider = (*provider).into();
                     config.model = (*model).into();
+                    self.restart(config, false).await;
+                }
+            }
+            ["/reload"] => {
+                if let Some(config) = self.config.clone() {
                     self.restart(config, false).await;
                 }
             }
@@ -513,23 +791,9 @@ impl App {
         if let Some(overlay) = &mut self.overlay {
             if key.code == KeyCode::Esc || ctrl && key.code == KeyCode::Char('c') {
                 self.overlay = None;
-            } else if let Overlay::History {
-                sessions: Some(sessions),
-                selected,
-            } = overlay
-            {
-                match key.code {
-                    KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => {
-                        *selected = (*selected + 1).min(sessions.len().saturating_sub(1))
-                    }
-                    KeyCode::Enter => {
-                        if let Some(id) = sessions.get(*selected).cloned() {
-                            self.overlay = None;
-                            self.resume(id);
-                        }
-                    }
-                    _ => {}
+            } else if let Overlay::History { picker } | Overlay::Inventory(picker) = overlay {
+                if let Some(action) = picker.key(key) {
+                    self.pick(action).await;
                 }
             } else if let Overlay::Commands(draft) = overlay {
                 if key.code == KeyCode::Enter {
@@ -650,7 +914,7 @@ fn edit_key(draft: &mut Draft, key: KeyEvent, alt_newline: bool) -> bool {
     true
 }
 
-pub async fn run(state: AppState, replay: Option<PathBuf>) -> io::Result<()> {
+pub async fn run(state: AppState, replay: Option<PathBuf>, show_history: bool) -> io::Result<()> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -677,6 +941,9 @@ pub async fn run(state: AppState, replay: Option<PathBuf>) -> io::Result<()> {
             conversation,
         )
     };
+    if show_history {
+        app.open_history();
+    }
     let mut terminal = TerminalSession::enter()?;
     let (sender, receiver) = mpsc::channel(64);
     let reader = std::thread::Builder::new()
@@ -765,14 +1032,35 @@ async fn event_loop(
                 }
             } => {
                 app.history = None;
-                if let Some(Overlay::History { sessions, .. }) = &mut app.overlay {
+                if let Some(Overlay::History { picker }) = &mut app.overlay {
                     match history {
-                        Ok(found) => *sessions = Some(found),
+                        Ok(found) => picker.rows = Some(found),
                         Err(error) => {
                             app.overlay = None;
                             app.status = format!("History scan failed: {error}");
                         }
                     }
+                }
+            },
+            staged = async {
+                match &mut app.staging {
+                    Some(task) => task.await,
+                    None => pending().await,
+                }
+            } => {
+                app.staging = None;
+                match staged {
+                    Ok((id, Ok(path))) => {
+                        let imported = app.conversation.import(&id, &path);
+                        let _ = std::fs::remove_file(path);
+                        if let Err(error) = imported {
+                            app.status = format!("Official history import failed: {error}");
+                        } else {
+                            app.resume(id);
+                        }
+                    }
+                    Ok((_, Err(error))) => app.status = format!("Official history unavailable: {error}"),
+                    Err(_) => app.status = "Official history worker stopped".into(),
                 }
             },
             _ = async {

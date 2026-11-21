@@ -17,6 +17,7 @@ use dsh_protocol::protocol::{
 };
 use dsh_protocol::stdio::{initialize_request, read_frame, request, shutdown_request, write_frame};
 use dsh_state::TransportState;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
@@ -60,6 +61,76 @@ pub struct RuntimeConfig {
     pub provider: String,
     pub model: String,
     initialize_timeout: Duration,
+    ecosystem: Option<Ecosystem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ecosystem {
+    adapter: PathBuf,
+    upstream: PathBuf,
+    shared: PathBuf,
+    home: PathBuf,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct StoredSession {
+    pub id: String,
+    pub cwd: String,
+    pub date: String,
+    pub current: bool,
+}
+
+impl Ecosystem {
+    fn command(&self) -> Command {
+        let mut command = Command::new("node");
+        command.env("DSH_TUI_UPSTREAM", &self.upstream);
+        command
+    }
+
+    fn helper(&self, method: &str) -> Command {
+        let mut command = self.command();
+        command.args([self.adapter.as_os_str(), method.as_ref()]);
+        command.arg(&self.home).arg(&self.shared);
+        command.stderr(Stdio::null());
+        command
+    }
+
+    fn prepare(&self) -> Result<PathBuf, String> {
+        if !self
+            .helper("prepare")
+            .status()
+            .map_err(|error| error.to_string())?
+            .success()
+        {
+            return Err("Could not import the supported DSH Desktop profile settings".into());
+        }
+        Ok(self.home.join("lingxi-overlay.json"))
+    }
+
+    pub fn history(&self) -> io::Result<Vec<StoredSession>> {
+        let result = self.helper("history").output()?;
+        if !result.status.success() {
+            return Err(io::Error::other("official DSH session listing failed"));
+        }
+        serde_json::from_slice(&result.stdout).map_err(io::Error::other)
+    }
+
+    pub fn stage(&self, id: &str) -> io::Result<PathBuf> {
+        let path = self
+            .home
+            .join(format!("lingxi-import-{}.ndjson", std::process::id()));
+        let result = self.helper("stage").arg(id).arg(&path).status();
+        if !matches!(result, Ok(status) if status.success()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(io::Error::other("could not snapshot the official session"));
+        }
+        Ok(path)
+    }
+
+    pub fn inventory(&self) -> io::Result<Value> {
+        serde_json::from_reader(File::open(self.home.join("lingxi-inventory.json"))?)
+            .map_err(io::Error::other)
+    }
 }
 
 impl RuntimeConfig {
@@ -87,28 +158,71 @@ impl RuntimeConfig {
         }
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
         let state_dir = root.join(".dsh-tui");
+        let (home, ecosystem) = if let Some(shared) = std::env::var_os("DSH_TUI_DSH_HOME") {
+            let shared = PathBuf::from(shared).canonicalize().map_err(|error| {
+                format!("Could not open the configured DSH data directory: {error}")
+            })?;
+            let mut identity = std::hash::DefaultHasher::new();
+            std::hash::Hash::hash(&shared, &mut identity);
+            let home = state_dir.join(format!(
+                "ecosystem-{:016x}",
+                std::hash::Hasher::finish(&identity)
+            ));
+            let ecosystem = Ecosystem {
+                adapter: root
+                    .join("runtime/host.mjs")
+                    .canonicalize()
+                    .map_err(|error| {
+                        format!("Could not locate the DSH ecosystem adapter: {error}")
+                    })?,
+                upstream: runtime_dir
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                shared,
+                home: home.clone(),
+            };
+            (home, Some(ecosystem))
+        } else {
+            (state_dir.join("agent"), None)
+        };
         Ok(Self {
             entry: entry.canonicalize().map_err(|error| error.to_string())?,
             cwd,
-            home: state_dir.join("agent"),
+            home,
             stderr: state_dir.join("runtime.log"),
             provider: std::env::var("DSH_TUI_PROVIDER")
                 .unwrap_or_else(|_| "deepseek-official".into()),
             model: std::env::var("DSH_TUI_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into()),
             initialize_timeout: Duration::from_secs(DEFAULT_INITIALIZE_TIMEOUT_SECS),
+            ecosystem,
         })
     }
 
-    fn command(&self) -> Command {
-        let mut command = Command::new("node");
+    pub fn ecosystem(&self) -> Option<&Ecosystem> {
+        self.ecosystem.as_ref()
+    }
+
+    fn command(&self) -> Result<Command, String> {
+        let mut command = if let Some(ecosystem) = &self.ecosystem {
+            let overlay = ecosystem.prepare()?;
+            let mut command = ecosystem.command();
+            command
+                .arg(&self.entry)
+                .args(["--profile", "sdk"])
+                .arg("--patch")
+                .arg(overlay);
+            command
+        } else {
+            let mut command = Command::new("node");
+            command.arg(&self.entry).args(["--profile", "sdk"]);
+            command
+        };
         command
-            .arg(&self.entry)
-            .args(["--profile", "sdk"])
             .current_dir(&self.cwd)
             .env("DSH_HOME", &self.home)
             .env("DSH_TELEMETRY_DISABLED", "1")
             .env("DSH_PERMISSION_MODE", "workspace-write");
-        command
+        Ok(command)
     }
 
     fn params(&self) -> InitializeParams {
@@ -151,7 +265,10 @@ impl RuntimeHandle {
                     inbox,
                 };
                 let _ = queues.events.send(TransportState::Connecting);
-                let result = run_child(&config, config.command(), &queues);
+                let result = (|| {
+                    std::fs::create_dir_all(&config.home).map_err(|error| error.to_string())?;
+                    run_child(&config, config.command()?, &queues)
+                })();
                 if let Err(error) = &result {
                     tracing::warn!(%error, "SDK runtime stopped");
                     let _ = queues.events.send(TransportState::Failed(error.clone()));

@@ -62,7 +62,7 @@ cargo run -p dsh-tui -- --check-runtime
 cargo run -p dsh-tui
 ```
 
-`dsh-tui` 支持 `--version` / `--help` / `--check-runtime`。界面需要交互终端，否则以退出码 2 结束。`--check-runtime` 可在 CI 中验证初始化与正常退出，失败返回非零退出码。
+`dsh-tui` 支持 `--version`、`--help`、`--check-runtime`、`--history` 和 `--replay-journal FILE`。界面需要交互终端，否则以退出码 2 结束。`--check-runtime` 可在 CI 中验证初始化与正常退出，失败返回非零退出码。
 
 客户端启动官方 `sdk` profile，使用 `workspace-write` 权限模式。默认路由是 `deepseek-official` / `deepseek-v4-pro`，可用 `DSH_TUI_PROVIDER` 和 `DSH_TUI_MODEL` 设置。运行时通过官方配置读取凭据。工具审批默认选中拒绝，选择「允许一次」后才会放行。
 
@@ -85,7 +85,26 @@ cargo run -p dsh-tui
 
 Compact 按轮次显示工具数量与状态。Normal 按执行步骤展示调用及输出摘要。Verbose 提供参数、输出和错误的完整文本。
 
-在命令面板中，`/new` 开始新会话，`/history` 列出本 TUI 记录的会话（方向键选择，Enter 恢复），`/resume ID` 恢复已知会话，`/cwd` 查询会话目录。空闲时可用 `/route PROVIDER MODEL` 重连到指定模型路由。`/failure` 跳到失败工具，`/view ID` 查看已经收到事件的子会话，`/draft` 取回发送失败的草稿，`/quit` 退出。
+在命令面板中，`/new` 开始新会话，`/history` 打开可搜索的会话选择器，`/resume ID` 恢复已知会话，`/cwd` 查询会话目录。空闲时可用 `/route PROVIDER MODEL` 重连到指定模型路由。`/failure` 跳到失败工具，`/view ID` 查看已经收到事件的子会话，`/draft` 取回发送失败的草稿，`/quit` 退出。
+
+### 使用已有 DSH 配置
+
+```sh
+cargo build --release --locked -p dsh-tui
+DSH_TUI_DSH_HOME="$HOME/.dsh" ./target/release/dsh-tui --history
+```
+
+启动后默认是 Compact。历史列表按日期、ID 或工作目录过滤，方向键选择，Enter 通过官方 SDK 恢复会话的独立副本。此后的写入留在 `.dsh-tui/ecosystem-*`。
+
+| 命令 | 操作 |
+| --- | --- |
+| `/models` | 浏览官方 Provider 和模型。Enter 切换路由 |
+| `/plugins` | 查看官方 SDK 加载的插件及状态 |
+| `/skills` | 浏览官方发现的 Skills。选择可调用项后把 `/技能名` 放入草稿 |
+| `/mcp` | 查看官方 MCP 服务和连接状态 |
+| `/reload` | 重载已支持的配置，重启 SDK 并恢复当前会话 |
+
+配置兼容范围覆盖官方 Provider 配置、Skills 和 MCP 配置。MCP 默认禁用连接。审阅服务配置后可在启动时设置 `DSH_TUI_ENABLE_MCP=1`。配置来源、共享历史策略、验证结果和限制见 [P5 开发记录](docs/p5.md)。
 
 ### 本地历史与离线回放
 

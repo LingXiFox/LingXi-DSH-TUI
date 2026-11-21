@@ -25,6 +25,7 @@ fn fixture() -> RuntimeConfig {
         provider: "deepseek-official".into(),
         model: "deepseek-v4-pro".into(),
         initialize_timeout: Duration::from_millis(300),
+        ecosystem: None,
     }
 }
 

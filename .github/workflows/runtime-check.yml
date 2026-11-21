@@ -12,6 +12,7 @@ on:
     branches: [main]
     paths:
       - "runtime/upstream"
+      - "runtime/host.mjs"
       - "runtime/upstream.lock.toml"
       - "runtime/protocol-source.lock"
       - "crates/dsh-protocol/**"

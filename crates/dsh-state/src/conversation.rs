@@ -206,6 +206,20 @@ impl Conversation {
         Ok(())
     }
 
+    /// Load a detached official session snapshot into the live transcript.
+    pub fn import(&mut self, id: &str, path: &Path) -> io::Result<()> {
+        if self.sessions.contains_key(id) {
+            return Ok(());
+        }
+        scan(path, |_, event| {
+            if session_id(event) != Some(id) {
+                return Err(io::Error::other("unexpected session in snapshot"));
+            }
+            self.push(event.clone())
+        })?;
+        self.flush()
+    }
+
     fn project(&mut self, notification: &Notification, record: Record) -> io::Result<()> {
         let Some(params) = &notification.params else {
             return Ok(());
