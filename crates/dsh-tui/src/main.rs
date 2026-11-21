@@ -2,6 +2,8 @@
 //! The official Agent integration remains in runtime.rs; a new UI will be built separately.
 
 mod build_info;
+// The complete official SDK bridge is retained while its new UI consumer is being designed.
+#[allow(dead_code)]
 mod runtime;
 mod terminal;
 
@@ -21,11 +23,23 @@ const DEFAULT_LOG_DIR: &str = ".dsh-tui";
 async fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(args.as_slice(), [arg] if arg == "--version" || arg == "-V") {
-        println!("LingXi DSH TUI {} ({})", build_info::VERSION, build_info::BUILD_ID);
+        println!(
+            "LingXi DSH TUI {} ({})",
+            build_info::VERSION,
+            build_info::BUILD_ID
+        );
         return ExitCode::SUCCESS;
     }
     if matches!(args.as_slice(), [arg] if arg == "--help" || arg == "-h") {
-        println!("LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime]\n\nThe legacy UI has been removed for a clean-room redesign.\nThe empty-screen scaffold exits with q, Esc, or Ctrl+C.", build_info::VERSION);
+        println!(
+            concat!(
+                "LingXi DSH TUI {}\n\n",
+                "Usage: dsh-tui [--version | --check-runtime]\n\n",
+                "Legacy UI removed for a clean-room redesign.\n",
+                "The placeholder exits with q, Esc or Ctrl+C."
+            ),
+            build_info::VERSION
+        );
         return ExitCode::SUCCESS;
     }
     if matches!(args.as_slice(), [arg] if arg == "--check-runtime") {
@@ -97,11 +111,15 @@ fn placeholder_terminal() -> io::Result<()> {
 
 async fn check_runtime() -> Result<(), String> {
     let config = runtime::RuntimeConfig::load(&build_info::workspace_root())?;
-    let mut sdk = runtime::RuntimeHandle::start(config).map_err(|error| error.to_string())?;
+    let mut sdk =
+        runtime::RuntimeHandle::start(config).map_err(|error| error.to_string())?;
     let result = loop {
         match sdk.events.recv().await {
             Some(TransportState::Ready { server_name, server_version }) => {
-                println!("SDK initialized: {server_name} {}", server_version.unwrap_or_default());
+                println!(
+                    "SDK initialized: {server_name} {}",
+                    server_version.unwrap_or_default()
+                );
                 break Ok(());
             }
             Some(TransportState::Failed(error)) => break Err(error),
@@ -109,7 +127,10 @@ async fn check_runtime() -> Result<(), String> {
             None => break Err("runtime worker closed without a handshake result".into()),
         }
     };
-    let shutdown = sdk.shutdown(|_| {}).await.map_err(|error| error.to_string());
+    let shutdown = sdk
+        .shutdown(|_| {})
+        .await
+        .map_err(|error| error.to_string());
     result.and(shutdown)?;
     println!("SDK shutdown: ok");
     Ok(())
@@ -120,15 +141,15 @@ fn init_logging() {
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("warn"));
     let log_dir = build_info::workspace_root().join(DEFAULT_LOG_DIR);
-    if std::fs::create_dir_all(&log_dir).is_ok() {
-        if let Ok(file) = std::fs::File::create(log_dir.join("dsh-tui.log")) {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-                .init();
-            return;
-        }
+    let log_file = std::fs::create_dir_all(&log_dir)
+        .and_then(|_| std::fs::File::create(log_dir.join("dsh-tui.log")));
+    if let Ok(file) = log_file {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+        return;
     }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
