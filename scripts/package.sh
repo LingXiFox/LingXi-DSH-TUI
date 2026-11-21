@@ -77,4 +77,4 @@ done
     echo "agent_commit=$(read_lock runtime commit)"
 } > "$BUNDLE/VERSION"
 
-printf 'package: ok %s\n' "${BUNDLE#$ROOT/}"
+printf 'package: ok %s\n' "${BUNDLE#"$ROOT"/}"
