@@ -39,10 +39,10 @@ fn renders_project_name_versions_and_status() {
 }
 
 #[test]
-fn renders_scope_note_for_round_one() {
+fn renders_sdk_connection_hint() {
     let text = render(&state(), 100, 30);
     assert!(
-        text.contains("Round 1 runs the UI skeleton only"),
+        text.contains("SDK connection status"),
         "missing scope note:\n{text}"
     );
 }
@@ -53,6 +53,7 @@ fn header_colour_tracks_transport_state() {
     state.apply(Action::Transport(TransportState::Failed("boom".into())));
     let text = render(&state, 100, 30);
     assert!(text.contains("failed / idle"));
+    assert!(text.contains("failed: boom"));
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();

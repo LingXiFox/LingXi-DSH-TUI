@@ -14,6 +14,8 @@ on:
       - "runtime/upstream"
       - "runtime/upstream.lock.toml"
       - "runtime/protocol-source.lock"
+      - "crates/dsh-protocol/**"
+      - "crates/dsh-tui/**"
       - ".github/workflows/runtime-check.yml"
       - "scripts/build-runtime.sh"
       - "scripts/smoke-runtime.sh"
@@ -21,6 +23,7 @@ on:
     paths:
       - "runtime/**"
       - "crates/dsh-protocol/**"
+      - "crates/dsh-tui/**"
       - ".github/workflows/runtime-check.yml"
       - "scripts/build-runtime.sh"
       - "scripts/smoke-runtime.sh"
@@ -71,3 +74,9 @@ jobs:
 
       - name: The TUI's protocol crate still matches the wire contract
         run: cargo run --quiet --locked -p dsh-protocol --bin dsh-runtime-lock -- contract
+
+      - name: The TUI initializes and shuts down the official SDK runtime
+        env:
+          DEEPSEEK_API_KEY: keyless-smoke-no-call
+          DEEPSEEK_BASE_URL: http://127.0.0.1:9
+        run: cargo run --quiet --locked -p dsh-tui -- --check-runtime

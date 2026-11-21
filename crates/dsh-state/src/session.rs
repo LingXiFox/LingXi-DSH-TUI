@@ -11,7 +11,7 @@ use crate::activity::{ActivityKind, ActivityLog};
 /// How the runtime subprocess is currently doing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TransportState {
-    /// Nothing spawned yet; this round always runs here.
+    /// Nothing spawned yet.
     #[default]
     Detached,
     /// A subprocess exists and the handshake is in flight.
@@ -149,7 +149,7 @@ impl AppState {
         state.note(
             ActivityKind::Runtime,
             format!(
-                "bundled agent {} @ {} (runtime not spawned this round)",
+                "bundled agent {} @ {}",
                 state.agent_tag, state.agent_commit_short
             ),
         );
@@ -215,10 +215,20 @@ impl AppState {
                 self.note(ActivityKind::Lifecycle, label);
             }
             Action::Transport(state) => {
-                self.note(
-                    ActivityKind::Transport,
-                    format!("transport -> {}", state.label()),
-                );
+                let detail = match &state {
+                    TransportState::Failed(error) => format!("failed: {error}"),
+                    TransportState::Ready {
+                        server_name,
+                        server_version,
+                    } => {
+                        format!(
+                            "ready: {server_name} SDK {}",
+                            server_version.as_deref().unwrap_or("unknown")
+                        )
+                    }
+                    _ => state.label().to_owned(),
+                };
+                self.note(ActivityKind::Transport, format!("transport -> {detail}"));
                 self.transport = state;
             }
             Action::Status(status) => self.status = status,
@@ -263,17 +273,10 @@ mod tests {
     use super::*;
 
     fn state() -> AppState {
-        AppState::new(&RuntimeLock::parse(&lock_text()).unwrap(), "test-build")
-    }
-
-    fn lock_text() -> String {
-        std::fs::read_to_string(workspace_lock())
-            .unwrap_or_else(|_| dsh_protocol::lock::SAMPLE_LOCK.to_owned())
-    }
-
-    fn workspace_lock() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../runtime/upstream.lock.toml")
+        AppState::new(
+            &RuntimeLock::parse(dsh_protocol::lock::SAMPLE_LOCK).unwrap(),
+            "test-build",
+        )
     }
 
     #[test]

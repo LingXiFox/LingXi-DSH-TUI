@@ -7,11 +7,12 @@
 use std::io;
 
 use crossterm::event::Event;
-use dsh_state::AppState;
+use dsh_state::{Action, AppState, TransportState};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::render;
+use crate::runtime::{RuntimeConfig, RuntimeHandle};
 use crate::terminal::TerminalSession;
 
 const TICK: Duration = Duration::from_millis(250);
@@ -22,11 +23,24 @@ const _: () = assert!(INPUT_CHANNEL >= 16);
 const INPUT_CHANNEL: usize = 64;
 
 /// Run the UI until the user quits or the terminal fails.
-pub async fn run(state: AppState) -> io::Result<()> {
+pub async fn run(mut state: AppState, config: Result<RuntimeConfig, String>) -> io::Result<()> {
     let mut session = TerminalSession::enter()?;
-    let result = event_loop(&mut session, state).await;
-    session.restore()?;
-    result
+    let mut runtime = match config
+        .and_then(|config| RuntimeHandle::start(config).map_err(|error| error.to_string()))
+    {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            state.apply(Action::Transport(TransportState::Failed(error)));
+            None
+        }
+    };
+    let result = event_loop(&mut session, state, &mut runtime).await;
+    let restored = session.restore();
+    let shutdown = match runtime {
+        Some(runtime) => runtime.shutdown().await,
+        None => Ok(()),
+    };
+    result.and(restored).and(shutdown)
 }
 
 /// Interval the reader blocks for before checking whether the UI is gone.
@@ -69,15 +83,33 @@ fn spawn_input_reader(sender: mpsc::Sender<Event>) -> std::thread::JoinHandle<()
         .expect("spawn input thread")
 }
 
-async fn event_loop(session: &mut TerminalSession, mut state: AppState) -> io::Result<()> {
+async fn event_loop(
+    session: &mut TerminalSession,
+    mut state: AppState,
+    runtime: &mut Option<RuntimeHandle>,
+) -> io::Result<()> {
     let (sender, mut receiver) = mpsc::channel::<Event>(INPUT_CHANNEL);
     let reader = spawn_input_reader(sender);
     let mut ticker = interval(TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut runtime_events_open = runtime.is_some();
 
     session.draw(&state)?;
     while !state.should_quit {
         tokio::select! {
+            transport = async {
+                match runtime.as_mut() {
+                    Some(runtime) => runtime.events.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if runtime_events_open => {
+                if let Some(transport) = transport {
+                    state.apply(Action::Transport(transport));
+                    session.draw(&state)?;
+                } else {
+                    runtime_events_open = false;
+                }
+            }
             maybe_event = receiver.recv() => {
                 let Some(event) = maybe_event else { break };
                 match event {

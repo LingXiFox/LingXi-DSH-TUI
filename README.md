@@ -52,14 +52,21 @@ runtime lock    folding       terminal lifecycle
 git clone --recurse-submodules https://github.com/LingXiFox/LingXi-DSH-TUI.git
 cd LingXi-DSH-TUI
 
-# 只跑 UI：不需要构建运行时
-cargo run -p dsh-tui
-
 # 构建内置官方运行时（首次较慢，需要 Node + pnpm）
 ./scripts/build-runtime.sh
+
+# 验证官方 SDK 握手与退出
+cargo run -p dsh-tui -- --check-runtime
+
+# 启动 TUI 并连接已构建的官方运行时
+cargo run -p dsh-tui
 ```
 
-`dsh-tui` 支持 `--version` / `--help`；需要交互终端，否则以退出码 2 结束。日志写在 `.dsh-tui/dsh-tui.log`，`RUST_LOG` / `DSH_TUI_LOG` 控制级别。
+`dsh-tui` 支持 `--version` / `--help` / `--check-runtime`。界面需要交互终端，否则以退出码 2 结束。`--check-runtime` 可在 CI 中验证初始化与正常退出，失败返回非零退出码。
+
+启动使用官方 `sdk-minimal` profile，默认路由为 `deepseek-official` / `deepseek-v4-pro`，可通过 `DSH_TUI_PROVIDER` / `DSH_TUI_MODEL` 调整。握手超时为 10 秒，退出超时为 3 秒，异常退出后界面显示原因。运行时缺失时界面进入故障状态。
+
+`DSH_TUI_ROOT` 可指定工作区或包目录。包目录也可由可执行文件位置自动识别。Agent 使用该目录下 `.dsh-tui/agent` 作为独立 `DSH_HOME`，遥测关闭。TUI 日志写入 `.dsh-tui/dsh-tui.log`，`RUST_LOG` / `DSH_TUI_LOG` 控制级别。官方运行时的 stderr 写入 `.dsh-tui/runtime.log`。
 
 ### 提交前必跑
 
@@ -106,7 +113,7 @@ cargo run -p dsh-protocol --bin dsh-runtime-lock -- check        # lock + 子模
 
 PR 打开或刷新后，流水线显式触发 `CI` 与 `Runtime check`。开启自动合并时，流水线等待本次触发的运行完成，并核对两次运行验证的提交。创建 PR 需要配置具有 Pull requests 写权限的 GitHub App（`SYNC_APP_ID` / `SYNC_APP_PRIVATE_KEY`），或在仓库设置允许 GitHub Actions 使用 `GITHUB_TOKEN` 创建 PR。
 
-`runtime/protocol-source.lock` 记录已审阅 SDK 协议源码的 Git blob 哈希。文件、字段、方法或传输实现变化都会使 `contract` 失败，维护者审阅 Rust 类型及测试后更新快照。导入的领域类型与真实 Agent 进程兼容性验证安排在第二轮。
+`runtime/protocol-source.lock` 记录已审阅 SDK 协议源码的 Git blob 哈希。文件、字段、方法或传输实现变化都会使 `contract` 失败，维护者审阅 Rust 类型及测试后更新快照。导入的领域类型兼容性验证在后续会话接入时补齐。`Runtime check` 会构建官方运行时并执行真实 SDK 初始化与退出检查。
 
 ### 发布
 
@@ -127,9 +134,16 @@ PR 打开或刷新后，流水线显式触发 `CI` 与 `Runtime check`。开启�
 - [x] 打包脚本骨架（`build-runtime.sh`、`package.sh`、`smoke-runtime.sh`）
 - [x] 版本单源 + 版本漂移守卫（含反向用例）
 
-### 未实现（明确列出，不假装有）
+### 已实现（round 2：运行时连接）
 
-- [ ] **没有真正的 Agent 通信**。当前启动画面状态恒为 `detached`；不拉进程、不握手、不建会话。
+- [x] 工作区与包目录中的官方 SDK 子进程启动，stdout 帧与 stderr 日志分流
+- [x] `initialize` 握手、SDK 身份校验、连接状态与故障原因展示
+- [x] 有界帧读取、初始化超时、退出取消、`shutdown` 请求与超时回收
+- [x] `--check-runtime` 及真实运行时 CI 握手检查
+
+### 后续任务
+
+- [ ] 会话建立、用户消息提交与 Agent 事件投影。
 - [ ] **没有对话 UI**。没有消息流、输入框、流式渲染、工具调用卡片、审批弹窗、取消。
 - [ ] **没有 Provider 配置**、模型选择、密钥管理界面。
 - [ ] **没有会话持久化界面的接入**（恢复 / 列举历史会话）。

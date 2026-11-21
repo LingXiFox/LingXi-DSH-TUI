@@ -1,11 +1,11 @@
 //! Binary entry point: terminal setup, event loop, terminal restore.
 //!
-//! Round one runs the UI against the real runtime lock but no subprocess: the
-//! screen reports `detached` until round two wires the SDK transport in.
+//! The bundled official Agent runs behind its SDK stdio process boundary.
 
 mod app;
 mod build_info;
 mod render;
+mod runtime;
 mod terminal;
 
 use std::io::IsTerminal;
@@ -29,10 +29,20 @@ async fn main() -> std::process::ExitCode {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version]\n\n  q / Esc  quit\n  ?        toggle key help\n  f        fold or expand tool rows",
+            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime]\n\n  --check-runtime  verify bundled SDK initialization and shutdown\n  q / Esc         quit\n  ?               toggle key help\n  f               fold or expand tool rows",
             build_info::VERSION
         );
         return std::process::ExitCode::SUCCESS;
+    }
+    if args.iter().any(|arg| arg == "--check-runtime") {
+        init_logging();
+        return match check_runtime().await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("runtime check failed: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         eprintln!("dsh-tui needs an interactive terminal (stdin and stdout are not a TTY)");
@@ -49,7 +59,8 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    match app::run(state).await {
+    let config = runtime::RuntimeConfig::load(&build_info::workspace_root());
+    match app::run(state, config).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("dsh-tui failed: {error}");
@@ -60,8 +71,39 @@ async fn main() -> std::process::ExitCode {
 
 fn load_state() -> Result<AppState, dsh_protocol::LockError> {
     let root = build_info::workspace_root();
-    let lock = RuntimeLock::load(root.join(DEFAULT_LOCK_PATH))?;
+    let path = if root.join("runtime.lock.toml").is_file() {
+        root.join("runtime.lock.toml")
+    } else {
+        root.join(DEFAULT_LOCK_PATH)
+    };
+    let lock = RuntimeLock::load(path)?;
     Ok(AppState::new(&lock, build_info::BUILD_ID))
+}
+
+async fn check_runtime() -> Result<(), String> {
+    let config = runtime::RuntimeConfig::load(&build_info::workspace_root())?;
+    let mut runtime = runtime::RuntimeHandle::start(config).map_err(|error| error.to_string())?;
+    let result = loop {
+        match runtime.events.recv().await {
+            Some(dsh_state::TransportState::Ready {
+                server_name,
+                server_version,
+            }) => {
+                println!(
+                    "SDK initialized: {server_name} {}",
+                    server_version.unwrap_or_default()
+                );
+                break Ok(());
+            }
+            Some(dsh_state::TransportState::Failed(error)) => break Err(error),
+            Some(_) => {}
+            None => break Err("runtime worker closed without a handshake result".into()),
+        }
+    };
+    let shutdown = runtime.shutdown().await.map_err(|error| error.to_string());
+    result.and(shutdown)?;
+    println!("SDK shutdown: ok");
+    Ok(())
 }
 
 /// File-based logging keeps stdout clean for the TUI; RUST_LOG opts in.

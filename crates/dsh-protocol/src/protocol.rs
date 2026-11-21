@@ -1,8 +1,6 @@
 //! Wire shapes for the DSH SDK JSON-RPC protocol (newline-delimited JSON-RPC 2.0).
 //!
-//! Round one ships the envelope plus the version handshake only. Session,
-//! prompt, tool and approval methods land in round two, once the bundled
-//! runtime is actually spawned.
+//! The host uses these envelopes for initialization and bounded shutdown.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,6 +61,19 @@ pub struct Response {
     /// Failure payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorObject>,
+}
+
+impl Response {
+    /// Decode a successful response payload or preserve the remote error.
+    pub fn decode_result<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        if let Some(error) = self.error {
+            return Err(format!("SDK error {}: {}", error.code, error.message));
+        }
+        let value = self
+            .result
+            .ok_or_else(|| "SDK response has no result".to_owned())?;
+        serde_json::from_value(value).map_err(|error| format!("invalid SDK result: {error}"))
+    }
 }
 
 fn deserialize_result<'de, D: serde::Deserializer<'de>>(
@@ -248,8 +259,15 @@ pub enum SessionStatusState {
 impl Frame {
     /// Classify a raw JSON value into a frame.
     pub fn parse(value: &Value) -> Result<Self, FrameError> {
+        if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(FrameError::InvalidEnvelope);
+        }
         let has_id = value.get("id").is_some();
         let has_method = value.get("method").is_some();
+        if has_id && !has_method && (value.get("result").is_some() == value.get("error").is_some())
+        {
+            return Err(FrameError::InvalidEnvelope);
+        }
         let value = value.clone();
         match (has_id, has_method) {
             (true, true) => serde_json::from_value(value)
@@ -276,6 +294,9 @@ impl<'de> Deserialize<'de> for Frame {
 /// Frame decoding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    /// Protocol marker or response payload does not match JSON-RPC 2.0.
+    #[error("invalid JSON-RPC 2.0 envelope")]
+    InvalidEnvelope,
     /// JSON did not match any frame shape.
     #[error("malformed JSON-RPC frame: {0}")]
     Decode(serde_json::Error),

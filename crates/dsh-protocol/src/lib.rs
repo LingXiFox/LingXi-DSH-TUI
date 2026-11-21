@@ -16,6 +16,7 @@
 pub mod lock;
 pub mod protocol;
 pub mod releases;
+pub mod stdio;
 pub mod sync;
 pub mod version;
 

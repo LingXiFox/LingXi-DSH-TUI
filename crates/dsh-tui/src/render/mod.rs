@@ -165,7 +165,7 @@ fn draw_side(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                " Round 1 runs the UI skeleton only; Host RPC lands in round 2. ",
+                " SDK connection status appears in Activity. ",
                 Style::default().fg(Color::DarkGray),
             )),
         ]
