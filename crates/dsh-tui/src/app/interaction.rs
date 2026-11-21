@@ -5,7 +5,7 @@ use dsh_protocol::protocol::{JsonRpcId, METHOD_APPROVAL_REQUEST, METHOD_USER_QUE
 use dsh_state::draft::Draft;
 use serde_json::{Value, json};
 
-use super::{Modal, edit_key, insert};
+use super::{ListItem, Modal, edit_key, insert};
 
 pub(super) struct Interaction {
     id: JsonRpcId,
@@ -204,7 +204,11 @@ impl Question {
         let mut rows = Vec::new();
         for (i, (label, description)) in self.options.iter().enumerate().take(end).skip(start) {
             let state = if self.selected[i] { "x" } else { " " };
-            rows.push(format!("[{state}] {label}  {description}"));
+            rows.push(ListItem {
+                title: format!("[{state}] {label}"),
+                subtitle: description.clone(),
+                ..ListItem::default()
+            });
         }
         if end == self.options.len() {
             rows.push("Custom answer".into());

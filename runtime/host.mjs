@@ -149,10 +149,31 @@ async function history(mode, shared, home, id, journal) {
   if (mode === 'history') {
     const rows = (await store.list()).filter(({ header }) => header.origin !== 'subagent')
     rows.sort((a, b) => b.header.createdAt - a.header.createdAt)
-    process.stdout.write(JSON.stringify(rows.map(({ header, formatStatus }) => ({
-      id: header.id, cwd: header.cwd ?? '', date: new Date(header.createdAt).toISOString().slice(0, 10),
-      current: formatStatus === 'current',
-    }))))
+    const entries = []
+    let remaining = 12 * 1024 * 1024
+    const deadline = performance.now() + 2500
+    for (const { header, formatStatus, sizeBytes } of rows) {
+      const current = formatStatus === 'current'
+      let title
+      // The persistence header has no title. Consult only small current logs through its read API.
+      if (current && sizeBytes > 0 && sizeBytes <= Math.min(remaining, 512 * 1024) && performance.now() < deadline) {
+        remaining -= sizeBytes
+        try {
+          const handle = await store.open(header.id, 'read')
+          try {
+            const { events } = await handle.read(0, 4096)
+            title = events.findLast(event => event.type === 'session/title')?.data.title
+            if (!title) {
+              const user = events.find(event => event.type === 'user/message' && event.data.source.kind === 'user')
+              title = user?.data.content.find(part => part.type === 'text')?.text
+            }
+          } finally { await handle.close() }
+        } catch { /* A busy or unavailable log still has its catalog entry. */ }
+      }
+      entries.push({ id: header.id, cwd: header.cwd ?? '', date: new Date(header.createdAt).toISOString().slice(0, 10),
+        current, title: typeof title === 'string' ? title.trim().split('\n')[0].slice(0, 160) || undefined : undefined })
+    }
+    process.stdout.write(JSON.stringify(entries))
     return
   }
   const source = await store.stat(id)

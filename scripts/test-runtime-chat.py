@@ -210,10 +210,10 @@ def exercise(binary, root, work, server):
         os.write(terminal, b"Read fixture.txt\r")
         expect("Confirmed response 2")
         expect("Turn finished")
-        expect("1 tools")
+        expect("1 tool · Read 1")
         assert FILE_TEXT not in screen_text(output), "Compact mode leaked tool output"
         os.write(terminal, b"\t")
-        expect("fixture-read")
+        expect("fixture.txt")
         os.write(terminal, b"\x0c")
         expect("Normal")
         os.write(terminal, b"\x0c")
@@ -339,7 +339,13 @@ def verify_ecosystem(binary, root, work, runtime):
 
     try:
         expect("ready")
+        expect(row["title"])
+        assert row["id"] not in screen_text(output), "History exposed the full session ID"
+        os.write(terminal, b"\x1bOQ")  # F2, xterm
+        expect("Session details")
         expect(row["id"])
+        os.write(terminal, b"\x1b")
+        expect("History")
         os.write(terminal, b"\r")
         expect("Session resumed")
         expect("Test child session")
@@ -347,6 +353,15 @@ def verify_ecosystem(binary, root, work, runtime):
         inventory = json.loads(inventory_path.read_text())
         assert any(provider["id"] == "deepseek-official" for provider in inventory["providers"])
         assert inventory["plugins"] and "skills" in inventory and inventory["mcp"] == []
+        os.write(terminal, b"\x10/sidebar\r")
+        expect("Workspace")
+        expect("Context · last request")
+        os.write(terminal, b"\x10/models\r")
+        expect("Provider / Model")
+        os.write(terminal, b"deepseek-v4-pro")
+        expect("deepseek-v4-pro")
+        os.write(terminal, b"\x1b")
+        expect("Workspace")
         os.write(terminal, b"\x10/quit\r")
         expect("\x1b[?1049l", raw=True)
         _, status = os.waitpid(process, 0)

@@ -77,15 +77,17 @@ cargo run -p dsh-tui
 | Shift+方向键 / Ctrl+A | 选择文本 |
 | Ctrl+P | 打开命令面板，输入关键字过滤，方向键选择后按 Enter；也可直接输入完整 `/命令` |
 | Ctrl+L | 切换 Compact、Normal、Verbose |
-| Tab | 展开或折叠工具组、单个调用或子会话摘要 |
+| Tab | 展开或折叠选中的工具组、单个调用、长消息、推理或子会话 |
+| F1 / F2 | 会话详情 / 历史选择器中选中条目的详情 |
+| F7 | 切换右侧工作区侧栏；窄于 100 列时自动隐藏 |
 | F6 / Esc | 切换输入与历史焦点，或关闭浮层、从子会话返回 |
 | PgUp / PgDn | 翻页。历史焦点下 End 恢复跟随最新消息 |
 | Ctrl+C | 中断当前任务并重连，空闲时退出 |
 | ? | 查看帮助 |
 
-Compact 按轮次显示工具数量与状态。Normal 按执行步骤展示调用及输出摘要。Verbose 提供参数、输出和错误的完整文本。
+Compact 将相邻工具调用收为一行，显示数量和状态。展开组后可看步骤及结果摘要，再展开单个调用才显示完整日志。Normal 默认展示步骤，Verbose 默认展示详情。超过八个视觉行的用户消息默认折叠；推理和子会话可以独立展开。未识别事件仍写入会话档案，只通过 `/debug` 逐条查看，不插入正文。
 
-P6 界面参考 [OpenCode 2.3.2](https://github.com/anomalyco/opencode/tree/v2.3.2/packages/tui/src) 的会话页、输入区与选择弹窗：单列正文最大 104 格，底部是带边框的可换行草稿和模型信息栏。推理档位取自 SDK 的模型选择或请求头；没有记录时使用模型默认值，离线回放则显示 `—`。缓存数字是上一条回复实际报告的读写 token 数，`—` 表示未上报。历史、模型、插件、技能、MCP、`/settings` 和权限提示共用有暗色遮罩的自适应弹窗。弹窗内 `Esc` 返回，权限详情较长时用 `PgUp` / `PgDn` 阅读。权限仍默认拒绝。界面只响应输入、尺寸变化及 SDK 事件，不轮询重绘。
+界面参考 [OpenCode TUI](https://github.com/anomalyco/opencode/tree/cfbf3f717169162a505187cc578895bda1e35a11/packages/tui)：正文最大 108 列，底部输入框与正文对齐，可随草稿增高。推理与缓存信息来自 SDK 记录；`—` 表示未上报。F7 侧栏默认隐藏，只显示实际工作区、上下文、任务、文件和 SDK 状态。历史、模型、插件、技能、MCP、设置、命令和权限提示共用自适应浮层，`Esc` 返回。较长的权限详情用 `PgUp` / `PgDn` 阅读，默认拒绝不变。界面只响应输入、尺寸变化及 SDK 事件，不轮询重绘。
 
 在命令面板中，`/new` 开始新会话，`/history` 打开可搜索的会话选择器，`/resume ID` 恢复已知会话，`/cwd` 查询会话目录。空闲时可用 `/route PROVIDER MODEL` 重连到指定模型路由。`/failure` 跳到失败工具，`/view ID` 查看已经收到事件的子会话，`/draft` 取回发送失败的草稿，`/quit` 退出。
 
@@ -96,7 +98,7 @@ cargo build --release --locked -p dsh-tui
 DSH_TUI_DSH_HOME="$HOME/.dsh" ./target/release/dsh-tui --history
 ```
 
-启动后默认是 Compact。历史列表按日期、ID 或工作目录过滤，方向键选择，Enter 通过官方 SDK 恢复会话的独立副本。此后的写入留在 `.dsh-tui/ecosystem-*`。
+启动后默认是 Compact。历史列表优先显示已记录标题和项目；没有标题时用首条用户消息摘要，无法读取则显示「Untitled session」。可按标题、日期、ID 或工作目录过滤，F2 查看完整 ID，Enter 通过官方 SDK 恢复独立副本。此后的写入留在 `.dsh-tui/ecosystem-*`。
 
 | 命令 | 操作 |
 | --- | --- |

@@ -1,0 +1,100 @@
+=== Empty · 80×24 ===
+  LingXi DSH  /  New session  ·  Archive                                 ready
+
+  Enter a prompt to start this session.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │› Write a prompt…                                                         │
+  │                                                                          │
+  │  deepseek-official / d…-v4-pro  ·  Reasoning: default  ·  Cache last: —  │
+  ╰──────────────────────────────────────────────────────────────────────────╯
+  Compact  ·  tail  ·  prompt   Ctrl+P commands · F7 sidebar
+=== Chat · 80×24 ===
+  LingXi DSH  /  Review the archive  ·  Archive                          ready
+
+  请n检e查 这 段r归m档t，t并 逐t项r核 对h。s
+  … Tab to expand prompt
+
+  ▸ ✓ 12 tools · Bash 4 · Edit 3 · Read 5
+  Checklist updated · 1/1 complete
+  ▸ Reasoning
+  ## Findings
+
+  Replay is **stable**.
+  - Input order preserved
+  - Duplicates ignored
+
+  ```rust
+  let archive = open()?;
+  ```
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │› 继r续t检 查 ？r                                                              │
+  │  Keep the source unchanged.                                              │
+  │  deepseek-…-pro  ·  Reasoning: high  ·  Cache last: read 2048 / write 0  │
+  ╰──────────────────────────────────────────────────────────────────────────╯
+  Compact  ·  tail  ·  prompt   Ctrl+P commands · F7 sidebar
+=== Expanded tools · 80×24 ===
+  LingXi DSH  /  Review the archive  ·  Archive                          ready
+
+  ▾ ✓ 12 tools · Bash 4 · Edit 3 · Read 5
+    ▸ read · done  src/archive.rs
+      Checked archive.
+    ▸ read · done  src/archive.rs
+      Checked archive.
+    ▸ read · done  src/archive.rs
+      Checked archive.
+    ▸ read · done  src/archive.rs
+      Checked archive.
+    ▸ read · done  src/archive.rs
+      Checked archive.
+    ▸ edit · done  src/archive.rs
+      Checked archive.
+    ▸ edit · done  src/archive.rs
+      Checked archive.
+    ▸ edit · done  src/archive.rs
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │› 继r续t检 查 ？r                                                              │
+  │  Keep the source unchanged.                                              │
+  │  deepseek-…-pro  ·  Reasoning: high  ·  Cache last: read 2048 / write 0  │
+  ╰──────────────────────────────────────────────────────────────────────────╯
+  Compact  ·  history  ·  transcript   Ctrl+P commands · F7 sidebar
+=== Tool approval · 80×24 ===
+  LingXi DSH  /  Review the archive  ·  Archive                          ready
+
+  请 检 查2这t段o归s档·，B并s逐 项 核 对d。t
+  … Tab to expand prompt
+
+  ▸ ✓ 12 tools · Bash 4 · Edit 3 · Read 5
+  Checklist updated · 1/1 complete
+  ▸ Reasoning
+
+     Tool approval                                                      esc
+
+     A command requires explicit approval.
+     › Deny
+       Allow once
+     PgUp/PgDn scroll · Esc close
+
+  ```
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │› 继r续t检 查 ？r                                                              │
+  │  Keep the source unchanged.                                              │
+  │  deepseek-…-pro  ·  Reasoning: high  ·  Cache last: read 2048 / write 0  │
+  ╰──────────────────────────────────────────────────────────────────────────╯
+  Compact  ·  tail  ·  prompt   Ctrl+P commands · F7 sidebar

@@ -51,23 +51,25 @@ fn visible(view: &mut Viewport, conversation: &Conversation, width: u16, height:
 #[test]
 fn folds_keep_call_identity_across_modes_and_jump_to_failure() {
     let mut conversation = Conversation::default();
-    tool(&mut conversation, 1, "first".into(), "LONG-RESULT-Ω", true);
+    let output = format!("Preview of failure {} FULL-RESULT-Ω", "x".repeat(170));
+    tool(&mut conversation, 1, "first".into(), &output, true);
     message(&mut conversation, 3, "assistant reply");
     let mut view = Viewport::default();
     let compact = visible(&mut view, &conversation, 90, 12);
     assert!(compact.contains("1 failed") && compact.contains("assistant reply"));
-    assert!(!compact.contains("LONG-RESULT-Ω"));
+    assert!(!compact.contains("Preview of failure"));
     view.toggle("s", &conversation);
     let open = visible(&mut view, &conversation, 90, 12);
-    assert!(open.contains("fixture.txt") && open.contains("first"));
-    assert!(!open.contains("LONG-RESULT-Ω"));
+    assert!(open.contains("fixture.txt"));
+    assert!(open.contains("Preview of failure"));
+    assert!(!open.contains("FULL-RESULT-Ω"));
     assert!(view.failure("s", &conversation));
-    assert!(visible(&mut view, &conversation, 75, 12).contains("LONG-RESULT-Ω"));
+    assert!(visible(&mut view, &conversation, 75, 12).contains("FULL-RESULT-Ω"));
     view.mode = Mode::Normal;
-    assert!(visible(&mut view, &conversation, 75, 12).contains("LONG-RESULT-Ω"));
+    assert!(visible(&mut view, &conversation, 75, 12).contains("FULL-RESULT-Ω"));
     view.toggle("s", &conversation);
     view.mode = Mode::Verbose;
-    assert!(!visible(&mut view, &conversation, 75, 12).contains("LONG-RESULT-Ω"));
+    assert!(!visible(&mut view, &conversation, 75, 12).contains("FULL-RESULT-Ω"));
 }
 
 #[test]
@@ -181,14 +183,16 @@ fn benchmark_chat() {
                  conversation: &Conversation| {
         let screen = Screen {
             cwd: "/workspace",
+            branch: None,
             session: "s",
             route: "fixture / model",
-            version: "test",
             transport: &TransportState::Detached,
             running: false,
             status: "",
             draft,
             modal: None,
+            sidebar: false,
+            inventory: &Default::default(),
         };
         terminal
             .draw(|frame| draw(frame, &screen, conversation, view))

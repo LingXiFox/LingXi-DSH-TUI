@@ -1,6 +1,6 @@
 //! Ordered SDK event journal and turn-based transcript projection.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -17,17 +17,56 @@ const REORDER_WINDOW: usize = 32;
 /// Display rows identified by their index inside a session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
-    /// A human message, assistant message, or status notice.
+    /// A message or human-readable status with an archived body.
     Text {
-        /// Speaker or notice kind.
-        label: &'static str,
+        /// Semantic presentation category.
+        kind: TextKind,
         /// Terminal-independent text or Markdown.
         body: Text,
     },
-    /// One collapsible group tied to an upstream turn number.
-    Tools(u64),
+    /// Consecutive tool activity, keyed by the first event sequence.
+    ToolActivity(u64),
     /// In-process child session linked by the official notification.
-    Child(String),
+    SubAgent(String),
+}
+
+/// Text presentation categories; never inferred from labels in the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKind {
+    /// A user-authored prompt.
+    UserMessage,
+    /// An assistant response.
+    AssistantMessage,
+    /// Recorded model reasoning.
+    Reasoning,
+    /// A recorded checklist update.
+    Todo,
+    /// A permission decision recorded by the Agent.
+    Approval,
+    /// A user-visible command or turn status.
+    Notice,
+    /// A user-visible failure.
+    Error,
+}
+
+/// Current checklist item, as reported by DSH.
+#[derive(Debug)]
+pub struct Todo {
+    /// Checklist label.
+    pub content: Text,
+    /// Official checklist status.
+    pub status: TodoStatus,
+}
+
+/// Checklist state, as reported by DSH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    /// Not yet started.
+    Pending,
+    /// In progress.
+    InProgress,
+    /// Finished.
+    Completed,
 }
 
 /// Tool details belonging to an explicit upstream turn and call ID.
@@ -41,6 +80,8 @@ pub struct Tool {
     pub step: Option<u64>,
     /// Original arguments string.
     pub arguments: Text,
+    /// Path explicitly named by a supported filesystem tool.
+    pub path: Option<String>,
     /// Text projection of the tool's result blocks.
     pub output: Option<Text>,
     /// SDK-reported failure.
@@ -51,9 +92,11 @@ pub struct Tool {
     pub interrupted: bool,
 }
 
-/// Projection for one real turn number.
+/// A contiguous group of calls belonging to one upstream turn.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Turn {
+    /// Upstream turn number.
+    pub number: u64,
     /// Calls ordered by their first recorded event.
     pub tools: Vec<Tool>,
     /// Tool name counts for the compact view.
@@ -62,7 +105,8 @@ pub struct Turn {
     pub running: usize,
     /// Failed calls in the turn.
     pub failed: usize,
-    lookup: HashMap<String, usize>,
+    /// Calls interrupted by disconnection without result.
+    pub interrupted: usize,
 }
 
 /// Model metadata recorded in a model selection or resolved request header.
@@ -100,8 +144,8 @@ pub struct CacheUsage {
 pub struct Session {
     /// Renderable top-level rows.
     pub rows: Vec<Row>,
-    /// Tool groups keyed by official turn number.
-    pub turns: BTreeMap<u64, Turn>,
+    /// Tool activity groups keyed by their first event sequence.
+    pub activity: BTreeMap<u64, Turn>,
     /// Whole-agent status from the SDK.
     pub running: bool,
     /// Parent session if this is a local child.
@@ -110,6 +154,20 @@ pub struct Session {
     pub route: Option<ModelRoute>,
     /// Cache counters, if reported for the latest assistant response.
     pub cache: Option<CacheUsage>,
+    /// Latest official session title, when recorded.
+    pub title: Option<String>,
+    /// Input tokens reported by the latest assistant response.
+    pub input_tokens: Option<u64>,
+    /// Output tokens reported by the latest assistant response.
+    pub output_tokens: Option<u64>,
+    /// Context capacity advertised by the active model route.
+    pub context_window: Option<u64>,
+    /// Current checklist items (only the latest snapshot).
+    pub todos: Vec<Todo>,
+    /// Last reported planning mode.
+    pub plan: Option<bool>,
+    /// Paths explicitly named by successful edit/write calls, not a Git diff.
+    pub edited_paths: BTreeSet<String>,
     /// Latest child completion or turn outcome.
     pub outcome: Option<String>,
     /// Latest assembled assistant text for child-session previews.
@@ -118,13 +176,16 @@ pub struct Session {
     pub failures: BTreeMap<usize, usize>,
     /// Number of events whose meaning is not projected by this client.
     pub unhandled: usize,
+    /// Direct SDK child session IDs.
+    pub children: Vec<String>,
     /// Increments when rows are reconstructed after a late event.
     pub generation: u64,
     ordered: BTreeMap<u64, Record>,
     pending: BTreeMap<u64, Record>,
     last_seq: Option<u64>,
     group_rows: HashMap<u64, usize>,
-    children: Vec<String>,
+    calls: HashMap<u64, HashMap<String, (u64, usize)>>,
+    approvals: HashMap<String, (usize, String)>,
 }
 
 /// Raw SDK messages and their derived session views.
@@ -139,14 +200,25 @@ pub struct Conversation {
 pub struct History(Vec<PathBuf>);
 
 impl History {
-    /// Enumerate root sessions recorded by this Host, newest first.
-    pub fn sessions(self) -> io::Result<Vec<String>> {
-        let mut sessions = HashMap::new();
+    /// Enumerate root session IDs and recorded titles, newest first.
+    pub fn sessions(self) -> io::Result<Vec<(String, Option<String>)>> {
+        let mut sessions = HashMap::<String, ((usize, u64), Option<String>)>::new();
         let mut children = HashSet::new();
         for (run, path) in self.0.iter().enumerate() {
             scan(path, |offset, notification| {
                 if let Some(id) = session_id(notification) {
-                    sessions.insert(id.to_owned(), (run, offset));
+                    let entry = sessions.entry(id.to_owned()).or_default();
+                    entry.0 = (run, offset);
+                    if let Some(event) = notification
+                        .params
+                        .as_ref()
+                        .map(|params| &params["event"])
+                        .filter(|event| event["type"] == "session/title")
+                    {
+                        entry.1 = event["data"]["title"]
+                            .as_str()
+                            .map(|title| title.chars().take(180).collect());
+                    }
                 }
                 if let Some((_, child)) = child_link(notification) {
                     children.insert(child.to_owned());
@@ -156,8 +228,11 @@ impl History {
         }
         let mut sessions: Vec<_> = sessions.into_iter().collect();
         sessions.retain(|(id, _)| !children.contains(id));
-        sessions.sort_unstable_by_key(|(_, position)| std::cmp::Reverse(*position));
-        Ok(sessions.into_iter().map(|(id, _)| id).collect())
+        sessions.sort_unstable_by_key(|(_, (position, _))| std::cmp::Reverse(*position));
+        Ok(sessions
+            .into_iter()
+            .map(|(id, (_, title))| (id, title))
+            .collect())
     }
 }
 
@@ -216,6 +291,29 @@ impl Conversation {
     /// Read a visible body through the bounded transcript cache.
     pub fn body(&self, text: &Text) -> io::Result<Arc<String>> {
         self.archive.body(text)
+    }
+
+    /// Load one original event for the explicit Debug Viewer, not the transcript.
+    pub fn debug_event(
+        &mut self,
+        id: &str,
+        from: Option<u64>,
+        newer: bool,
+    ) -> io::Result<Option<(u64, Value)>> {
+        let Some(session) = self.sessions.get(id) else {
+            return Ok(None);
+        };
+        let record = match from {
+            Some(seq) if newer => session
+                .ordered
+                .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
+                .next(),
+            Some(seq) => session.ordered.range(..seq).next_back(),
+            None => session.ordered.last_key_value(),
+        };
+        record
+            .map(|(&seq, &record)| Ok((seq, event_at(&mut self.archive, record)?)))
+            .transpose()
     }
 
     /// Ensure a clean exit persists the original inbound records.
@@ -292,7 +390,7 @@ impl Conversation {
             let parent_session = self.sessions.entry(parent.into()).or_default();
             if !parent_session.children.iter().any(|id| id == child) {
                 parent_session.children.push(child.into());
-                parent_session.rows.push(Row::Child(child.into()));
+                parent_session.rows.push(Row::SubAgent(child.into()));
             }
             let session = self.sessions.entry(child.into()).or_default();
             session.parent = Some(parent.into());
@@ -384,12 +482,13 @@ impl Conversation {
 impl Session {
     fn settle(&mut self) {
         self.running = false;
-        for turn in self.turns.values_mut().filter(|turn| turn.running > 0) {
+        for turn in self.activity.values_mut().filter(|turn| turn.running > 0) {
             for tool in &mut turn.tools {
                 if tool.output.is_none() {
                     tool.interrupted = true;
                 }
             }
+            turn.interrupted += turn.running;
             turn.running = 0;
         }
     }
@@ -443,11 +542,20 @@ impl Session {
 
     fn rebuild(&mut self, archive: &mut Archive) -> io::Result<()> {
         self.rows.clear();
-        self.turns.clear();
+        self.activity.clear();
         self.group_rows.clear();
+        self.calls.clear();
+        self.approvals.clear();
         self.failures.clear();
         self.route = None;
         self.cache = None;
+        self.title = None;
+        self.input_tokens = None;
+        self.output_tokens = None;
+        self.context_window = None;
+        self.todos.clear();
+        self.plan = None;
+        self.edited_paths.clear();
         self.summary = None;
         self.unhandled = 0;
         self.generation += 1;
@@ -457,7 +565,7 @@ impl Session {
         }
         self.ordered = ordered;
         self.rows
-            .extend(self.children.iter().cloned().map(Row::Child));
+            .extend(self.children.iter().cloned().map(Row::SubAgent));
         Ok(())
     }
 
@@ -465,10 +573,12 @@ impl Session {
         let data = &event["data"];
         match event["type"].as_str().unwrap_or("unknown") {
             "user/message" if data["source"]["kind"].as_str() == Some("user") => {
-                self.text("You", blocks(&data["content"]), archive)?;
+                self.text(TextKind::UserMessage, blocks(&data["content"]), archive)?;
             }
             "user/message" => {}
             "assistant/message" => {
+                let reasoning = stream_text(&data["stream"], "reasoning-chunks");
+                self.text(TextKind::Reasoning, reasoning, archive)?;
                 let mut body = blocks(&data["message"]["content"]);
                 if body.is_empty() {
                     body = stream_text(&data["stream"], "text-chunks");
@@ -477,68 +587,153 @@ impl Session {
                     let body = archive.text(body)?;
                     self.summary = Some(body.clone());
                     self.rows.push(Row::Text {
-                        label: "Assistant",
+                        kind: TextKind::AssistantMessage,
                         body,
                     });
                 }
-                let reasoning = stream_text(&data["stream"], "reasoning-chunks");
-                self.text("Reasoning", reasoning, archive)?;
                 let usage = &data["usage"];
+                self.input_tokens = usage["inputTokens"].as_u64();
+                self.output_tokens = usage["outputTokens"].as_u64();
                 let read = usage["cacheReadTokens"].as_u64();
                 let write = usage["cacheWriteTokens"].as_u64();
                 self.cache =
                     (read.is_some() || write.is_some()).then_some(CacheUsage { read, write });
                 if data["interrupted"] == true {
-                    self.text("Notice", "Assistant output interrupted".into(), archive)?;
+                    self.text(
+                        TextKind::Notice,
+                        "Assistant output interrupted".into(),
+                        archive,
+                    )?;
                 }
             }
             "turn/end" => {
                 if let Some(kind) = data["reason"]["kind"].as_str() {
                     self.outcome = Some(kind.into());
-                    if !data["reason"]["error"].is_null() {
-                        self.text("Error", data["reason"]["error"].to_string(), archive)?;
+                    if kind == "error" {
+                        let message = data["reason"]["error"]["message"]
+                            .as_str()
+                            .unwrap_or("The turn failed");
+                        self.text(TextKind::Error, message.into(), archive)?;
+                    } else if let Some(message) = match kind {
+                        "blocked" => Some("Turn blocked"),
+                        "aborted" => Some("Turn cancelled"),
+                        "interrupted" => Some("Turn interrupted"),
+                        "max-tokens" => Some("Response reached its token limit"),
+                        _ => None,
+                    } {
+                        self.text(TextKind::Notice, message.into(), archive)?;
                     }
                 }
             }
-            "tool/call" => self.tool(data, false, archive)?,
-            "tool/result" => self.tool(data, true, archive)?,
+            "tool/call" => self.tool(event, false, archive)?,
+            "tool/result" => self.tool(event, true, archive)?,
             "model/selection" => {
                 if let Some(route) = ModelRoute::from_event(data) {
+                    self.context_window = None;
                     self.route = Some(route);
                 }
             }
             "request/header" => {
                 if let Some(route) = ModelRoute::from_event(&data["header"]["config"]) {
+                    if self.route.as_ref().is_some_and(|current| {
+                        current.provider != route.provider || current.model != route.model
+                    }) {
+                        self.context_window = None;
+                    }
                     self.route = Some(route);
                 }
             }
-            "turn/start" | "step/start" | "step/end" | "request/context" | "system/message"
-            | "developer/message" | "session/end-seed" | "assistant/attempt" => {}
-            kind => {
-                self.unhandled += 1;
-                if kind.starts_with("command/")
-                    || kind.starts_with("todo/")
-                    || kind.starts_with("plan/")
-                    || kind.starts_with("approval/")
-                {
-                    self.text("Event", format!("{kind} · {data}"), archive)?;
+            "request/context" => self.context_window = data["contextWindow"].as_u64(),
+            "session/title" => self.title = data["title"].as_str().map(metadata),
+            "plan/mode" => self.plan = data["active"].as_bool(),
+            "todo/write" => {
+                self.todos.clear();
+                for item in data["todos"].as_array().into_iter().flatten() {
+                    let status = match item["status"].as_str() {
+                        Some("pending") => TodoStatus::Pending,
+                        Some("in_progress") => TodoStatus::InProgress,
+                        Some("completed") => TodoStatus::Completed,
+                        _ => continue,
+                    };
+                    if let Some(content) = item["content"].as_str() {
+                        self.todos.push(Todo {
+                            content: archive.text(content.into())?,
+                            status,
+                        });
+                    }
+                }
+                let complete = self
+                    .todos
+                    .iter()
+                    .filter(|todo| todo.status == TodoStatus::Completed)
+                    .count();
+                self.text(
+                    TextKind::Todo,
+                    format!(
+                        "Checklist updated · {complete}/{} complete",
+                        self.todos.len()
+                    ),
+                    archive,
+                )?;
+            }
+            "approval/asked" => {
+                if let (Some(key), Some(tool)) = (data["id"].as_str(), data["toolName"].as_str()) {
+                    let tool = metadata(tool);
+                    self.approvals
+                        .insert(key.into(), (self.rows.len(), tool.clone()));
+                    self.text(
+                        TextKind::Approval,
+                        format!("Approval requested · {tool}"),
+                        archive,
+                    )?;
                 }
             }
+            "approval/decided" => {
+                if let (Some(key), Some(outcome)) = (data["id"].as_str(), data["outcome"].as_str())
+                {
+                    if let Some((row, tool)) = self.approvals.remove(key) {
+                        let status = match outcome {
+                            "allowed-once" => "Approved once",
+                            "rejected" => "Approval declined",
+                            "cancelled" => "Approval cancelled",
+                            _ => "Approval unavailable",
+                        };
+                        self.rows[row] = Row::Text {
+                            kind: TextKind::Approval,
+                            body: archive.text(format!("{status} · {tool}"))?,
+                        };
+                    }
+                }
+            }
+            "command/done" => {
+                if let Some(message) = data["text"].as_str() {
+                    let kind = if data["kind"] == "error" {
+                        TextKind::Error
+                    } else {
+                        TextKind::Notice
+                    };
+                    self.text(kind, message.into(), archive)?;
+                }
+            }
+            "turn/start" | "step/start" | "step/end" | "system/message" | "developer/message"
+            | "session/end-seed" | "assistant/attempt" | "command/run" | "approval/policy" => {}
+            _ => self.unhandled += 1,
         }
         Ok(())
     }
 
-    fn text(&mut self, label: &'static str, body: String, archive: &mut Archive) -> io::Result<()> {
+    fn text(&mut self, kind: TextKind, body: String, archive: &mut Archive) -> io::Result<()> {
         if !body.is_empty() {
             self.rows.push(Row::Text {
-                label,
+                kind,
                 body: archive.text(body)?,
             });
         }
         Ok(())
     }
 
-    fn tool(&mut self, data: &Value, result: bool, archive: &mut Archive) -> io::Result<()> {
+    fn tool(&mut self, event: &Value, result: bool, archive: &mut Archive) -> io::Result<()> {
+        let data = &event["data"];
         let Some(number) = data["turn"].as_u64() else {
             return Ok(());
         };
@@ -549,23 +744,52 @@ impl Session {
             data["callId"].as_str()
         };
         let Some(id) = id else { return Ok(()) };
-        let row = *self.group_rows.entry(number).or_insert_with(|| {
-            self.rows.push(Row::Tools(number));
-            self.rows.len() - 1
-        });
-        let turn = self.turns.entry(number).or_default();
-        let index = *turn.lookup.entry(id.into()).or_insert_with(|| {
+        let calls = self.calls.entry(number).or_default();
+        let (group, index) = if let Some(&location) = calls.get(id) {
+            location
+        } else {
+            let group = match self.rows.last() {
+                Some(Row::ToolActivity(group)) if self.activity[group].number == number => *group,
+                _ => {
+                    let Some(seq) = event["seq"].as_u64() else {
+                        return Ok(());
+                    };
+                    self.group_rows.insert(seq, self.rows.len());
+                    self.rows.push(Row::ToolActivity(seq));
+                    self.activity.insert(
+                        seq,
+                        Turn {
+                            number,
+                            ..Turn::default()
+                        },
+                    );
+                    seq
+                }
+            };
+            let turn = self
+                .activity
+                .get_mut(&group)
+                .ok_or_else(|| io::Error::other("missing activity group"))?;
             turn.tools.push(Tool {
                 id: id.into(),
                 ..Tool::default()
             });
             turn.running += 1;
-            turn.tools.len() - 1
-        });
+            let index = turn.tools.len() - 1;
+            calls.insert(id.into(), (group, index));
+            (group, index)
+        };
+        let row = self.group_rows[&group];
+        let turn = self
+            .activity
+            .get_mut(&group)
+            .ok_or_else(|| io::Error::other("missing activity group"))?;
         let tool = &mut turn.tools[index];
         if result && tool.output.is_none() {
             tool.output = Some(archive.text(blocks(&message["content"]))?);
-            if !std::mem::take(&mut tool.interrupted) {
+            if std::mem::take(&mut tool.interrupted) {
+                turn.interrupted -= 1;
+            } else {
                 turn.running -= 1;
             }
             tool.failed = message["isError"] == true;
@@ -581,10 +805,25 @@ impl Session {
             tool.name = data["name"].as_str().unwrap_or("tool").into();
             tool.step = data["step"].as_u64();
             *turn.counts.entry(tool.name.clone()).or_default() += 1;
-            tool.arguments = archive.text(data["arguments"].as_str().unwrap_or("").into())?;
+            let args = data["arguments"].as_str().unwrap_or("");
+            if matches!(tool.name.as_str(), "read" | "edit" | "write") {
+                tool.path = serde_json::from_str::<Value>(args)
+                    .ok()
+                    .and_then(|value| value["file_path"].as_str().map(metadata));
+            }
+            tool.arguments = archive.text(args.into())?;
+        }
+        if tool.output.is_some() && !tool.failed && matches!(tool.name.as_str(), "edit" | "write") {
+            if let Some(path) = &tool.path {
+                self.edited_paths.insert(path.clone());
+            }
         }
         Ok(())
     }
+}
+
+fn metadata(text: &str) -> String {
+    text.chars().take(256).collect()
 }
 
 fn event_at(archive: &mut Archive, record: Record) -> io::Result<Value> {
@@ -743,6 +982,128 @@ mod tests {
     }
 
     #[test]
+    fn projects_semantic_notices_without_leaking_raw_events() {
+        let mut chat = Conversation::default();
+        let unseen = event(7, "future/internal", json!({"opaque":"raw-only"}));
+        for message in [
+            event(1, "session/title", json!({"title":"Review workspace"})),
+            event(2, "request/context", json!({"contextWindow":128000})),
+            event(
+                3,
+                "todo/write",
+                json!({"todos":[{"content":"Review diff","status":"completed"}]}),
+            ),
+            event(
+                4,
+                "approval/asked",
+                json!({"id":"request-1","toolName":"bash","reason":"raw reason"}),
+            ),
+            event(
+                5,
+                "approval/decided",
+                json!({"id":"request-1","outcome":"rejected"}),
+            ),
+            event(
+                6,
+                "command/done",
+                json!({"kind":"error","text":"No command found"}),
+            ),
+            unseen.clone(),
+        ] {
+            chat.push(message).unwrap();
+        }
+        let session = &chat.sessions["root"];
+        assert_eq!(session.title.as_deref(), Some("Review workspace"));
+        assert_eq!(session.context_window, Some(128000));
+        let rows: Vec<_> = session
+            .rows
+            .iter()
+            .map(|row| match row {
+                Row::Text { kind, body } => (*kind, chat.body(body).unwrap().to_string()),
+                _ => panic!("expected text row"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (TextKind::Todo, "Checklist updated · 1/1 complete".into()),
+                (TextKind::Approval, "Approval declined · bash".into()),
+                (TextKind::Error, "No command found".into()),
+            ]
+        );
+        let (seq, raw) = chat.debug_event("root", None, false).unwrap().unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(raw, unseen.params.unwrap()["event"]);
+        assert_eq!(
+            chat.debug_event("root", Some(seq), false)
+                .unwrap()
+                .unwrap()
+                .0,
+            6
+        );
+        assert!(chat.debug_event("root", Some(seq), true).unwrap().is_none());
+    }
+
+    #[test]
+    fn groups_consecutive_calls_and_matches_results_after_a_message_boundary() {
+        let mut chat = Conversation::default();
+        for message in [
+            event(
+                1,
+                "tool/call",
+                json!({"turn":1,"callId":"read-1","name":"read"}),
+            ),
+            event(
+                2,
+                "tool/call",
+                json!({"turn":1,"callId":"edit-1","name":"edit","arguments":"{\"file_path\":\"src/main.rs\"}"}),
+            ),
+            event(
+                3,
+                "assistant/message",
+                json!({"message":{"content":"Checking another file"}}),
+            ),
+            event(
+                4,
+                "tool/call",
+                json!({"turn":1,"callId":"read-2","name":"read"}),
+            ),
+            event(
+                5,
+                "tool/result",
+                json!({"turn":1,"message":{"toolCallId":"edit-1","content":"changed"}}),
+            ),
+            event(
+                6,
+                "tool/result",
+                json!({"turn":1,"message":{"toolCallId":"read-2","content":"missing","isError":true}}),
+            ),
+        ] {
+            chat.push(message).unwrap();
+        }
+        let session = &chat.sessions["root"];
+        assert!(matches!(
+            session.rows.as_slice(),
+            [
+                Row::ToolActivity(1),
+                Row::Text {
+                    kind: TextKind::AssistantMessage,
+                    ..
+                },
+                Row::ToolActivity(4)
+            ]
+        ));
+        assert_eq!(
+            session.activity[&1].counts,
+            [("edit".into(), 1), ("read".into(), 1)].into()
+        );
+        assert_eq!(session.activity[&1].running, 1);
+        assert_eq!(session.activity[&4].failed, 1);
+        assert_eq!(session.failures.get(&2), Some(&0));
+        assert!(session.edited_paths.contains("src/main.rs"));
+    }
+
+    #[test]
     fn latest_route_and_cache_distinguish_resolved_effort_zero_and_missing() {
         let mut chat = Conversation::default();
         for item in [
@@ -822,11 +1183,11 @@ mod tests {
         chat.push(tool.clone()).unwrap();
         let session = &chat.sessions["root"];
         assert_eq!(session.generation, 1);
-        assert_eq!(session.turns[&7].tools[0].step, Some(3));
-        assert_eq!(session.turns[&7].failed, 1);
+        assert_eq!(session.activity[&2].tools[0].step, Some(3));
+        assert_eq!(session.activity[&2].failed, 1);
         assert_eq!(session.failures.get(&1), Some(&0));
         assert_eq!(
-            chat.body(session.turns[&7].tools[0].output.as_ref().unwrap())
+            chat.body(session.activity[&2].tools[0].output.as_ref().unwrap())
                 .unwrap()
                 .as_str(),
             "missing"
@@ -838,7 +1199,7 @@ mod tests {
             "AB"
         );
         assert!(
-            matches!(&session.rows[3], Row::Text { label: "Reasoning", body } if chat.body(body).unwrap().as_str() == "CD")
+            matches!(&session.rows[2], Row::Text { kind: TextKind::Reasoning, body } if chat.body(body).unwrap().as_str() == "CD")
         );
         assert_eq!(session.unhandled, 1);
         assert_eq!(chat.received_count(), 6);
@@ -850,7 +1211,7 @@ mod tests {
             ordered.push(item).unwrap();
         }
         assert_eq!(session.rows, ordered.sessions["root"].rows);
-        assert_eq!(session.turns, ordered.sessions["root"].turns);
+        assert_eq!(session.activity, ordered.sessions["root"].activity);
     }
 
     #[test]
@@ -877,9 +1238,12 @@ mod tests {
         .unwrap();
         chat.disconnect().unwrap();
         let parent = &chat.sessions["root"];
-        assert_eq!(parent.rows, [Row::Child("child".into()), Row::Tools(1)]);
-        assert_eq!(parent.turns[&1].running, 0);
-        assert!(parent.turns[&1].tools[0].interrupted);
+        assert_eq!(
+            parent.rows,
+            [Row::SubAgent("child".into()), Row::ToolActivity(8)]
+        );
+        assert_eq!(parent.activity[&8].running, 0);
+        assert!(parent.activity[&8].tools[0].interrupted);
         assert_eq!(chat.sessions["child"].outcome.as_deref(), Some("ok"));
     }
 
@@ -927,7 +1291,10 @@ mod tests {
             .unwrap();
             chat.sync().unwrap();
             assert_eq!(chat.received_count(), 7);
-            assert_eq!(chat.history().unwrap().sessions().unwrap(), ["root"]);
+            assert_eq!(
+                chat.history().unwrap().sessions().unwrap(),
+                [("root".into(), None)]
+            );
         }
         assert!(!work.0.join("01.spool").exists());
         let mut reader = BufReader::new(File::open(&path).unwrap());
@@ -945,7 +1312,10 @@ mod tests {
             .unwrap();
 
         let mut chat = Conversation::open(&work.0, "02").unwrap();
-        assert_eq!(chat.history().unwrap().sessions().unwrap(), ["root"]);
+        assert_eq!(
+            chat.history().unwrap().sessions().unwrap(),
+            [("root".into(), None)]
+        );
         chat.replay("root").unwrap();
         chat.replay("root").unwrap();
         let root = &chat.sessions["root"];

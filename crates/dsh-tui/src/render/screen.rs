@@ -1,46 +1,68 @@
 //! Compact transcript, draft editor, and modal presentation.
 
 use dsh_state::TransportState;
-use dsh_state::conversation::{Conversation, Session};
+use dsh_state::conversation::{Conversation, Session, TodoStatus};
 use dsh_state::draft::Draft;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::chat::{Viewport, safe_text, wrap};
-
-pub(super) const ACCENT: Color = Color::Rgb(119, 206, 193);
-const TEXT: Color = Color::Rgb(222, 228, 234);
-const MUTED: Color = Color::Rgb(151, 161, 172);
-const SURFACE: Color = Color::Rgb(31, 37, 45);
-const DIALOG: Color = Color::Rgb(24, 29, 35);
-const FIELD: Color = Color::Rgb(37, 44, 53);
-const BORDER: Color = Color::Rgb(74, 89, 100);
-const VEIL: Color = Color::Rgb(9, 12, 15);
-const VEILED_TEXT: Color = Color::Rgb(92, 101, 108);
-const WARNING: Color = Color::Rgb(230, 187, 109);
+use super::theme::*;
 
 pub struct Screen<'a> {
     pub cwd: &'a str,
+    pub branch: Option<&'a str>,
     pub session: &'a str,
     pub route: &'a str,
-    pub version: &'a str,
     pub transport: &'a TransportState,
     pub running: bool,
     pub status: &'a str,
     pub draft: &'a Draft,
     pub modal: Option<Modal<'a>>,
+    pub sidebar: bool,
+    pub inventory: &'a InventorySummary,
+}
+
+#[derive(Default)]
+pub struct InventorySummary {
+    pub skills: Option<usize>,
+    pub plugins: Option<(usize, usize)>,
+    pub mcp: Option<Vec<(String, String)>>,
+}
+
+#[derive(Clone, Default)]
+pub struct ListItem {
+    pub title: String,
+    pub subtitle: String,
+    pub state: String,
+    pub group: String,
+}
+
+impl From<String> for ListItem {
+    fn from(title: String) -> Self {
+        Self {
+            title,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&str> for ListItem {
+    fn from(title: &str) -> Self {
+        title.to_owned().into()
+    }
 }
 
 pub struct Modal<'a> {
     pub title: &'a str,
     pub body: String,
     pub input: Option<(&'a Draft, &'a str)>,
-    pub list: Option<(Vec<String>, usize)>,
+    pub list: Option<(Vec<ListItem>, usize)>,
     pub hint: &'a str,
     pub scroll: u16,
     pub warning: bool,
@@ -70,51 +92,72 @@ pub fn draw(
     if area.is_empty() {
         return;
     }
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(BACKGROUND).fg(TEXT));
     let gutter = u16::from(area.width >= 44) * 2;
-    let width = (area.width - 2 * gutter).min(104);
-    let x = area.x + (area.width - width) / 2;
+    let side = if screen.sidebar && area.width >= 100 && area.height >= 12 {
+        40
+    } else {
+        0
+    };
+    let width = (area.width - 2 * gutter - side).min(108);
+    let x = area.x + (area.width - width - side) / 2;
     let line = |y| Rect::new(x, area.y + y, width, 1);
     let framed = area.height >= 10 && width >= 18;
-    let mut header = vec![
-        Span::styled("LingXi", Style::default().fg(ACCENT).bold()),
-        Span::styled(
-            format!(
-                "  · {}",
-                if screen.running {
-                    "running"
-                } else {
-                    screen.transport.label()
-                }
+    let session = conversation.sessions.get(screen.session);
+    let status = if screen.running {
+        "● Running"
+    } else if screen.route == "Offline replay" {
+        "Offline"
+    } else {
+        screen.transport.label()
+    };
+    let status_width = if width >= 36 {
+        status.width() as u16 + 2
+    } else {
+        0
+    };
+    let title = session
+        .and_then(|s| s.title.as_deref())
+        .unwrap_or(if session.is_some() {
+            "Untitled session"
+        } else {
+            "New session"
+        });
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled("LingXi DSH", Style::default().fg(ACCENT).bold()),
+            Span::styled(
+                fit(
+                    &format!("  /  {title}  ·  {}", project(screen.cwd)),
+                    width.saturating_sub(status_width + 10),
+                ),
+                MUTED,
             ),
-            Style::default().fg(MUTED),
-        ),
-    ];
-    if !framed {
-        header.push(Span::raw(format!("   {}", safe_text(screen.route))));
+        ]),
+        line(0),
+    );
+    if status_width > 0 {
+        let color = if screen.running {
+            ACCENT
+        } else if matches!(screen.transport, TransportState::Failed(_)) {
+            ERROR
+        } else {
+            MUTED
+        };
+        frame.render_widget(
+            Line::styled(status, color).right_aligned(),
+            Rect::new(x + width - status_width, area.y, status_width, 1),
+        );
     }
-    frame.render_widget(Line::from(header), line(0));
     if area.height == 1 {
         if let Some(modal) = &screen.modal {
             overlay(frame, area, modal);
         }
         return;
     }
-    let header_height = if area.height >= 14 {
-        3
-    } else if area.height >= 7 {
-        2
-    } else {
-        1
-    };
-    if header_height >= 2 {
-        frame.render_widget(
-            Line::styled(
-                fit(&format!("{}  ·  DSH {}", screen.cwd, screen.version), width),
-                MUTED,
-            ),
-            line(1),
-        );
-    }
+    let header_height = 1 + u16::from(area.height >= 12);
     let footer_height = u16::from(area.height >= 4);
     let draft_height = if framed {
         let rows = draft_rows(screen.draft, width - 2);
@@ -150,7 +193,7 @@ pub fn draw(
             };
             frame.render_widget(
                 Paragraph::new(safe_text(&hint))
-                    .fg(Color::Gray)
+                    .fg(MUTED)
                     .wrap(Wrap { trim: false }),
                 chat,
             );
@@ -161,13 +204,7 @@ pub fn draw(
     let input = Rect::new(x, area.y + draft_y, width, draft_height);
     let composer_focused = !viewport.focused && screen.modal.is_none();
     if framed {
-        composer(
-            frame,
-            input,
-            screen,
-            conversation.sessions.get(screen.session),
-            composer_focused,
-        );
+        composer(frame, input, screen, session, composer_focused);
     } else {
         edit(frame, input, screen.draft, composer_focused, "› ");
     }
@@ -183,10 +220,10 @@ pub fn draw(
             "prompt"
         };
         let badge = format!("{}  ·  {position}  ·  {focus}", viewport.mode.label());
-        let keys = if width >= 72 {
-            "Enter send · Ctrl+J newline · Ctrl+P commands"
+        let keys = if width >= 81 {
+            "Enter send · Ctrl+J newline · Ctrl+P commands · F7 sidebar"
         } else {
-            "Ctrl+P commands"
+            "Ctrl+P commands · F7 sidebar"
         };
         let status = if screen.status.is_empty() {
             keys
@@ -202,9 +239,167 @@ pub fn draw(
             line(area.height - 1),
         );
     }
+    if side > 0 {
+        draw_sidebar(
+            frame,
+            Rect::new(x + width + 2, area.y + 1, side - 2, area.height - 2),
+            screen,
+            session,
+            conversation,
+        );
+    }
     if let Some(modal) = &screen.modal {
         overlay(frame, area, modal);
     }
+}
+
+pub fn project(cwd: &str) -> &str {
+    std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(if cwd.is_empty() { "No project" } else { cwd })
+}
+
+fn draw_sidebar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    screen: &Screen<'_>,
+    session: Option<&Session>,
+    conversation: &Conversation,
+) {
+    let mut lines = Vec::with_capacity(usize::from(area.height));
+    let mut section = |label: &str, values: &[String]| {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::styled(
+            fit(label, area.width - 3),
+            Style::default().fg(TEXT).bold(),
+        ));
+        lines.extend(
+            values
+                .iter()
+                .map(|line| Line::styled(fit(line, area.width - 3), MUTED)),
+        );
+    };
+    section(
+        "Workspace",
+        &[
+            project(screen.cwd).to_owned(),
+            screen.branch.unwrap_or("Git branch unavailable").to_owned(),
+        ],
+    );
+    if let Some(session) = session {
+        let number = |n: Option<u64>| n.map_or_else(|| "—".into(), |n| n.to_string());
+        section(
+            "Context · last request",
+            &[
+                format!(
+                    "Input {} / {}",
+                    number(session.input_tokens),
+                    number(session.context_window)
+                ),
+                format!("Output {}", number(session.output_tokens)),
+            ],
+        );
+        if session.plan.is_some() || !session.todos.is_empty() {
+            let mut todos = Vec::new();
+            if let Some(active) = session.plan {
+                todos.push(
+                    if active {
+                        "Plan mode on"
+                    } else {
+                        "Plan mode off"
+                    }
+                    .into(),
+                );
+            }
+            for todo in session.todos.iter().take(5) {
+                let mark = match todo.status {
+                    TodoStatus::Pending => "○",
+                    TodoStatus::InProgress => "◉",
+                    TodoStatus::Completed => "✓",
+                };
+                if let Ok(text) = conversation.body(&todo.content) {
+                    todos.push(format!(
+                        "{mark} {}",
+                        text.split('\n')
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(100)
+                            .collect::<String>()
+                    ));
+                }
+            }
+            if session.todos.len() > 5 {
+                todos.push(format!("+{} more", session.todos.len() - 5));
+            }
+            section("Todo / Plan", &todos);
+        }
+        section(
+            "Scoped writes",
+            &[format!(
+                "{} files · successful edits/writes",
+                session.edited_paths.len()
+            )],
+        );
+        if !session.children.is_empty() {
+            let mut children = session
+                .children
+                .iter()
+                .take(4)
+                .map(|id| {
+                    let child = conversation.sessions.get(id);
+                    let title = child.and_then(|s| s.title.as_deref()).unwrap_or("Subagent");
+                    let state = child.and_then(|s| s.outcome.as_deref()).unwrap_or(
+                        if child.is_some_and(|s| s.running) {
+                            "running"
+                        } else {
+                            "no final status"
+                        },
+                    );
+                    format!("{title} · {state}")
+                })
+                .collect::<Vec<_>>();
+            if session.children.len() > 4 {
+                children.push(format!("+{} more", session.children.len() - 4));
+            }
+            section("Subagents", &children);
+        }
+    }
+    let inventory = screen.inventory;
+    if let Some(mcp) = &inventory.mcp {
+        let mut states = mcp
+            .iter()
+            .take(4)
+            .map(|(name, state)| format!("{name} · {state}"))
+            .collect::<Vec<_>>();
+        if mcp.len() > 4 {
+            states.push(format!("+{} more", mcp.len() - 4));
+        }
+        if states.is_empty() {
+            states.push("No configured servers".into());
+        }
+        section("MCP", &states);
+    }
+    let mut ecosystem = Vec::new();
+    if let Some(skills) = inventory.skills {
+        ecosystem.push(format!("{skills} skills"));
+    }
+    if let Some((enabled, total)) = inventory.plugins {
+        ecosystem.push(format!("{enabled} / {total} plugins enabled"));
+    }
+    if !ecosystem.is_empty() {
+        section("Ecosystem", &ecosystem);
+    }
+    let border = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(BORDER)
+        .padding(ratatui::widgets::Padding::left(2));
+    let inner = border.inner(area);
+    frame.render_widget(border, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn composer(
@@ -290,10 +485,10 @@ fn overlay(frame: &mut Frame<'_>, area: Rect, modal: &Modal<'_>) {
             .add_modifier(Modifier::DIM)
             .remove_modifier(Modifier::REVERSED),
     );
-    let wide = modal
-        .list
-        .as_ref()
-        .is_some_and(|(rows, _)| rows.iter().take(24).any(|row| row.width() > 60));
+    let wide = modal.list.as_ref().is_some_and(|(rows, _)| {
+        rows.iter()
+            .any(|row| !row.subtitle.is_empty() || !row.group.is_empty())
+    });
     let width = area
         .width
         .saturating_sub(u16::from(area.width >= 34) * 4)
@@ -419,7 +614,7 @@ fn overlay(frame: &mut Frame<'_>, area: Rect, modal: &Modal<'_>) {
         let start = selected
             .saturating_sub(count / 2)
             .min(rows.len().saturating_sub(count));
-        for (index, label) in rows.iter().enumerate().skip(start).take(count) {
+        for (index, item) in rows.iter().enumerate().skip(start).take(count) {
             let selected = index == *selected;
             let row = Rect {
                 y: inner.y + (index - start) as u16,
@@ -427,21 +622,43 @@ fn overlay(frame: &mut Frame<'_>, area: Rect, modal: &Modal<'_>) {
                 ..inner
             };
             let style = if selected {
-                Style::default().fg(VEIL).bg(accent).bold()
+                Style::default().fg(accent).bg(SELECTION).bold()
             } else {
                 Style::default().fg(TEXT)
             };
             frame.buffer_mut().set_style(row, style);
-            frame.render_widget(
-                Line::styled(
-                    fit(
-                        &format!("{} {label}", if selected { "›" } else { " " }),
-                        row.width,
-                    ),
-                    style,
-                ),
-                row,
-            );
+            let right = if row.width >= 24 && !item.state.is_empty() {
+                (item.state.width() as u16 + 2).min(row.width / 3)
+            } else {
+                0
+            };
+            let text_width = row.width.saturating_sub(right + 2);
+            let secondary = match (item.group.as_str(), item.subtitle.as_str()) {
+                ("", value) | (value, "") => value.to_owned(),
+                (group, subtitle) => format!("{group} · {subtitle}"),
+            };
+            let secondary_width = if text_width >= 23 && !secondary.is_empty() {
+                (secondary.width() as u16 + 3).min(text_width / 2)
+            } else {
+                0
+            };
+            let mut parts = vec![
+                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(fit(&item.title, text_width - secondary_width), style),
+            ];
+            if secondary_width > 0 {
+                parts.push(Span::styled(
+                    format!("   {}", fit(&secondary, secondary_width - 3)),
+                    MUTED,
+                ));
+            }
+            frame.render_widget(Line::from(parts), row);
+            if right > 0 {
+                frame.render_widget(
+                    Line::styled(fit(&item.state, right - 1), MUTED).right_aligned(),
+                    Rect::new(row.right() - right, row.y, right - 1, 1),
+                );
+            }
         }
     }
 }
@@ -573,6 +790,10 @@ fn edit(frame: &mut Frame<'_>, area: Rect, draft: &Draft, focused: bool, prefix:
 }
 
 #[cfg(test)]
+#[path = "screen_golden.rs"]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
@@ -606,14 +827,16 @@ mod tests {
         let mut viewport = Viewport::default();
         let screen = Screen {
             cwd: "/workspace",
+            branch: None,
             session: "session-test",
             route: "provider / model",
-            version: "0.2.2-rc.5",
             transport: &TransportState::Failed("broken pipe".into()),
             running: false,
             status: "",
             draft: &draft,
             modal: None,
+            sidebar: false,
+            inventory: &InventorySummary::default(),
         };
         terminal
             .draw(|frame| draw(frame, &screen, &conversation, &mut viewport))
@@ -626,7 +849,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         for expected in [
-            "/workspace",
+            "workspace",
             "provider / model",
             "broken pipe",
             "你 好",
@@ -652,17 +875,22 @@ mod tests {
         let draft = Draft::default();
         let mut picker = Modal::text(" History ", "");
         picker.input = Some((&draft, "Filter…"));
-        picker.list = Some(((0..41).map(|i| format!("Entry {i:02}")).collect(), 30));
+        picker.list = Some((
+            (0..41).map(|i| format!("Entry {i:02}").into()).collect(),
+            30,
+        ));
         let screen = Screen {
             cwd: "/workspace",
+            branch: None,
             session: "test",
             route: "provider / model",
-            version: "test",
             transport: &TransportState::Detached,
             running: false,
             status: "",
             draft: &draft,
             modal: Some(picker),
+            sidebar: false,
+            inventory: &InventorySummary::default(),
         };
         let mut viewport = Viewport::default();
         for (width, height) in [(180, 18), (32, 7), (9, 5)] {
@@ -672,7 +900,7 @@ mod tests {
                 .unwrap();
             let buffer = terminal.backend().buffer();
             if width == 180 {
-                let logo = &buffer[(38, 0)];
+                let logo = &buffer[(36, 0)];
                 assert_eq!(logo.symbol(), "L");
                 assert!(logo.modifier.contains(Modifier::DIM));
                 assert_eq!(logo.bg, VEIL);
@@ -681,7 +909,7 @@ mod tests {
             let row: String = buffer
                 .content
                 .iter()
-                .filter(|cell| cell.bg == ACCENT)
+                .filter(|cell| cell.bg == SELECTION)
                 .map(|cell| cell.symbol())
                 .collect();
             assert!(row.starts_with('›'), "no selected row at {width}×{height}");

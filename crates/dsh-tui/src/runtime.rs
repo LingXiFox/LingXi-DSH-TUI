@@ -75,6 +75,7 @@ pub struct Ecosystem {
 #[derive(Clone, Deserialize)]
 pub struct StoredSession {
     pub id: String,
+    pub title: Option<String>,
     pub cwd: String,
     pub date: String,
     pub current: bool,

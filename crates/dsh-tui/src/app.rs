@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use self::interaction::Interaction;
 use crate::render::{
     chat::{Mode, Viewport},
-    screen::{self, Modal, Screen},
+    screen::{self, InventorySummary, ListItem, Modal, Screen},
 };
 use crate::runtime::{Inbound, RpcResult, RuntimeConfig, RuntimeHandle};
 use crate::terminal::TerminalSession;
@@ -40,6 +40,8 @@ enum Operation {
 
 enum Overlay {
     Help,
+    Details(String, Option<Picker>),
+    Debug { seq: Option<u64>, body: String },
     Commands(Picker),
     History { picker: Picker },
     Inventory(Picker),
@@ -59,13 +61,29 @@ enum PickAction {
 
 struct Picker {
     title: &'static str,
-    rows: Option<Vec<(String, PickAction)>>,
+    rows: Option<Vec<Choice>>,
     query: Draft,
     selected: usize,
 }
 
+struct Choice {
+    item: ListItem,
+    action: PickAction,
+    detail: String,
+}
+
+impl Choice {
+    fn new(title: impl Into<String>, action: PickAction) -> Self {
+        Self {
+            item: title.into().into(),
+            action,
+            detail: String::new(),
+        }
+    }
+}
+
 impl Picker {
-    fn new(title: &'static str, rows: Option<Vec<(String, PickAction)>>) -> Self {
+    fn new(title: &'static str, rows: Option<Vec<Choice>>) -> Self {
         Self {
             title,
             rows,
@@ -74,21 +92,31 @@ impl Picker {
         }
     }
 
-    fn matches(&self) -> impl Iterator<Item = &(String, PickAction)> {
-        let query = self.query.text().to_lowercase();
-        self.rows
-            .iter()
-            .flatten()
-            .filter(move |(label, _)| label.to_lowercase().contains(&query))
+    fn matches(&self) -> impl Iterator<Item = &Choice> {
+        let query = self.query.text().trim().to_lowercase();
+        self.rows.iter().flatten().filter(move |choice| {
+            let item = &choice.item;
+            query.is_empty()
+                || [
+                    &item.title,
+                    &item.subtitle,
+                    &item.state,
+                    &item.group,
+                    &choice.detail,
+                ]
+                .into_iter()
+                .any(|value| value.to_lowercase().contains(&query))
+        })
     }
 
     fn modal(&self) -> Modal<'_> {
-        let start = self.selected.saturating_sub(20);
+        let selected = self.selected.min(self.matches().count().saturating_sub(1));
+        let start = selected.saturating_sub(20);
         let mut rows: Vec<_> = self
             .matches()
             .skip(start)
             .take(41)
-            .map(|(label, _)| label.clone())
+            .map(|choice| choice.item.clone())
             .collect();
         if rows.is_empty() {
             rows.push(
@@ -104,13 +132,17 @@ impl Picker {
         modal.list = Some((
             rows,
             if self.matches().next().is_some() {
-                self.selected - start
+                selected - start
             } else {
                 usize::MAX
             },
         ));
         modal.input = Some((&self.query, "Filter…"));
-        modal.hint = " ↑/↓ select · Enter open · Esc close ";
+        modal.hint = if self.title.contains("History") {
+            "↑/↓ select · Enter resume · F2 details · Esc close"
+        } else {
+            "↑/↓ select · Enter open · Esc close"
+        };
         modal
     }
 
@@ -129,7 +161,7 @@ impl Picker {
                 return self
                     .matches()
                     .nth(self.selected)
-                    .map(|(_, action)| action.clone());
+                    .map(|choice| choice.action.clone());
             }
             _ => {
                 if !matches!(key.code, KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL))
@@ -146,10 +178,14 @@ impl Picker {
 const COMMANDS: &[(&str, &str, bool)] = &[
     ("/history", "Search sessions", false),
     ("/models", "Switch provider or model", false),
+    ("/providers", "Inspect provider registration", false),
     ("/plugins", "Inspect official plugins", false),
     ("/skills", "Browse official skills", false),
     ("/mcp", "Inspect MCP status", false),
     ("/settings", "Set tool detail", true),
+    ("/sidebar", "Toggle workspace sidebar", true),
+    ("/details", "View current session details", true),
+    ("/debug", "Inspect raw recorded events", true),
     ("/new", "Start a session", false),
     ("/resume ID", "Resume a session", false),
     ("/cwd", "Show session directory", false),
@@ -163,44 +199,55 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("/quit", "Close the client", true),
 ];
 
-type HistoryResult = io::Result<Vec<(String, PickAction)>>;
+type HistoryResult = io::Result<Vec<Choice>>;
 type StageResult = (String, io::Result<PathBuf>);
 
-fn inventory_rows(kind: &str, inventory: &Value) -> (&'static str, Vec<(String, PickAction)>) {
+fn inventory_rows(kind: &str, inventory: &Value) -> (&'static str, Vec<Choice>) {
     let values = |key: &str| inventory[key].as_array().into_iter().flatten();
     let string = |value: &Value, key: &str| value[key].as_str().unwrap_or_default().to_owned();
     match kind {
-        "models" => {
+        "models" | "providers" => {
             let mut rows = Vec::new();
             for provider in values("providers") {
                 let id = string(provider, "id");
                 let name = string(provider, "name");
                 let models = provider["models"].as_array().into_iter().flatten();
-                if models.clone().next().is_none() {
-                    rows.push((
-                        format!("{name} ({id}) · no discoverable models"),
-                        PickAction::None,
-                    ));
+                if kind == "providers" || models.clone().next().is_none() {
+                    let mut choice = Choice::new(name, PickAction::None);
+                    choice.item.subtitle = id;
+                    choice.item.state = if provider["unavailable"].as_bool() == Some(true) {
+                        "Unavailable".into()
+                    } else {
+                        format!("{} models", models.count())
+                    };
+                    rows.push(choice);
+                    continue;
                 }
                 for model in models {
                     let model = string(model, "id");
-                    rows.push((
-                        format!("{id} / {model}"),
-                        PickAction::Route(id.clone(), model),
-                    ));
+                    let mut choice =
+                        Choice::new(model.clone(), PickAction::Route(id.clone(), model));
+                    choice.item.group = id.clone();
+                    rows.push(choice);
                 }
             }
-            (" Provider / Model ", rows)
+            (
+                if kind == "providers" {
+                    "Providers"
+                } else {
+                    "Provider / Model"
+                },
+                rows,
+            )
         }
         "plugins" => (
             " Official Plugins ",
             values("plugins")
                 .map(|entry| {
                     let phase = entry["phase"].as_str().unwrap_or("inactive");
-                    (
-                        format!("{} · {phase}", string(entry, "name")),
-                        PickAction::None,
-                    )
+                    let mut choice = Choice::new(string(entry, "name"), PickAction::None);
+                    choice.item.state = phase.into();
+                    choice
                 })
                 .collect(),
         ),
@@ -209,13 +256,14 @@ fn inventory_rows(kind: &str, inventory: &Value) -> (&'static str, Vec<(String, 
             values("skills")
                 .map(|entry| {
                     let name = string(entry, "name");
-                    let label = format!("{name} · {}", string(entry, "source"));
                     let action = if entry["userInvocable"].as_bool() == Some(true) {
-                        PickAction::Skill(name)
+                        PickAction::Skill(name.clone())
                     } else {
                         PickAction::None
                     };
-                    (label, action)
+                    let mut choice = Choice::new(name, action);
+                    choice.item.subtitle = string(entry, "source");
+                    choice
                 })
                 .collect(),
         ),
@@ -223,14 +271,50 @@ fn inventory_rows(kind: &str, inventory: &Value) -> (&'static str, Vec<(String, 
             " Official MCP ",
             values("mcp")
                 .map(|entry| {
-                    (
-                        format!("{} · {}", string(entry, "name"), string(entry, "state")),
-                        PickAction::None,
-                    )
+                    let mut choice = Choice::new(string(entry, "name"), PickAction::None);
+                    choice.item.state = string(entry, "state");
+                    choice
                 })
                 .collect(),
         ),
     }
+}
+
+fn summarize_inventory(value: &Value) -> InventorySummary {
+    InventorySummary {
+        skills: value["skills"].as_array().map(Vec::len),
+        plugins: value["plugins"].as_array().map(|rows| {
+            (
+                rows.iter()
+                    .filter(|row| row["enabled"].as_bool() == Some(true))
+                    .count(),
+                rows.len(),
+            )
+        }),
+        mcp: value["mcp"].as_array().map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row["name"].as_str().unwrap_or_default().to_owned(),
+                        row["state"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        }),
+    }
+}
+
+fn git_branch(cwd: &str) -> Option<String> {
+    let result = std::process::Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    result
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&result.stdout).trim().to_owned())
 }
 
 struct App {
@@ -251,6 +335,9 @@ struct App {
     modal_scroll: u16,
     status: String,
     cwd: String,
+    branch: Option<String>,
+    sidebar: bool,
+    inventory: InventorySummary,
     route: String,
     version: String,
     attached: bool,
@@ -286,6 +373,9 @@ impl App {
             modal_scroll: 0,
             status: String::new(),
             cwd: String::new(),
+            branch: None,
+            sidebar: false,
+            inventory: InventorySummary::default(),
             route: String::new(),
             version,
             attached: false,
@@ -306,7 +396,8 @@ impl App {
 
     fn start(&mut self, config: RuntimeConfig) {
         self.opened.clear();
-        self.cwd = config.cwd.to_string_lossy().into_owned();
+        self.set_cwd(&config.cwd.to_string_lossy());
+        self.inventory = InventorySummary::default();
         self.route = format!("{} / {}", config.provider, config.model);
         self.config = Some(config.clone());
         match RuntimeHandle::start(config) {
@@ -320,6 +411,56 @@ impl App {
 
     fn id(&self) -> &str {
         self.viewed.as_deref().unwrap_or(&self.session)
+    }
+
+    fn set_cwd(&mut self, cwd: &str) {
+        if self.cwd != cwd {
+            self.cwd = cwd.into();
+            self.branch = self.sidebar.then(|| git_branch(cwd)).flatten();
+        }
+    }
+
+    fn refresh_inventory(&mut self) {
+        if let Some(inventory) = self
+            .config
+            .as_ref()
+            .and_then(RuntimeConfig::ecosystem)
+            .and_then(|ecosystem| ecosystem.inventory().ok())
+        {
+            self.inventory = summarize_inventory(&inventory);
+        }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar = !self.sidebar;
+        if self.sidebar {
+            self.branch = git_branch(&self.cwd);
+            self.refresh_inventory();
+        }
+    }
+
+    fn debug(&mut self, from: Option<u64>, newer: bool) {
+        let id = self.id().to_owned();
+        let (seq, body) = match self.conversation.debug_event(&id, from, newer) {
+            Ok(Some((seq, event))) => {
+                let json = serde_json::to_string_pretty(&event).unwrap_or_default();
+                let mut end = json.len().min(24 * 1024);
+                while !json.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let tail = if end < json.len() {
+                    "\n… Full event retained in archive"
+                } else {
+                    ""
+                };
+                (Some(seq), format!("Event #{seq}\n\n{}{tail}", &json[..end]))
+            }
+            Ok(None) if from.is_some() => return,
+            Ok(None) => (None, "No recorded events in this session".into()),
+            Err(error) => (None, format!("Cannot read event: {error}")),
+        };
+        self.modal_scroll = 0;
+        self.overlay = Some(Overlay::Debug { seq, body });
     }
 
     fn busy(&self) -> bool {
@@ -337,7 +478,13 @@ impl App {
         let running = self.busy();
         let id = self.viewed.as_deref().unwrap_or(&self.session);
         let mut modal = self.interactions.first().map(Interaction::modal).or_else(|| match &self.overlay {
-            Some(Overlay::Help) => Some(Modal::text(" Keyboard ", "Enter sends · Ctrl+J inserts a newline\nShift+arrows select · Ctrl+A selects all\nPgUp/PgDn scroll · F6 switches focus\nTab folds · Ctrl+L changes mode · Ctrl+P opens commands\nEsc returns · Ctrl+C interrupts or quits")),
+            Some(Overlay::Help) => Some(Modal::text("Keyboard", "Enter sends · Ctrl+J inserts a newline\nShift+arrows select · Ctrl+A selects all\nPgUp/PgDn scroll · F6 switches focus\nTab folds · Ctrl+L changes mode · Ctrl+P opens commands\nF7 sidebar · F1 session details · F2 selected history details\nEsc returns · Ctrl+C interrupts or quits")),
+            Some(Overlay::Details(body, _)) => Some(Modal::text("Session details", body.as_str())),
+            Some(Overlay::Debug { body, .. }) => {
+                let mut modal = Modal::text("Debug viewer", body.as_str());
+                modal.hint = "←/→ event · PgUp/PgDn scroll · Esc close";
+                Some(modal)
+            }
             Some(Overlay::Commands(picker) | Overlay::History { picker } | Overlay::Inventory(picker) | Overlay::Settings(picker)) => Some(picker.modal()),
             None => None,
         });
@@ -346,14 +493,16 @@ impl App {
         }
         let screen = Screen {
             cwd: &self.cwd,
+            branch: self.branch.as_deref(),
             session: id,
             route: &self.route,
-            version: &self.version,
             transport: &self.transport,
             running,
             status: &self.status,
             draft: &self.draft,
             modal,
+            sidebar: self.sidebar,
+            inventory: &self.inventory,
         };
         let started = Instant::now();
         let result = terminal
@@ -461,7 +610,7 @@ impl App {
             (Operation::Resume(id), Ok(_)) => self.select_session(id),
             (Operation::Cwd(verbose), Ok(result)) => {
                 if let Some(cwd) = result["cwd"].as_str() {
-                    self.cwd = cwd.into();
+                    self.set_cwd(cwd);
                     self.attached = true;
                     self.opened.insert(self.session.clone());
                     if verbose {
@@ -494,6 +643,9 @@ impl App {
             self.interactions.clear();
         }
         self.transport = state;
+        if ready && self.sidebar {
+            self.refresh_inventory();
+        }
         if ready && std::mem::take(&mut self.resume_on_ready) {
             self.resume(self.session.clone());
         }
@@ -633,30 +785,47 @@ impl App {
             let mut rows = Vec::new();
             if let Some(ecosystem) = ecosystem {
                 for session in ecosystem.history()? {
-                    let label = format!(
-                        "{}  {}  {}{}",
-                        session.date,
-                        session.id,
-                        session.cwd,
-                        if session.current {
-                            ""
-                        } else {
-                            " · older format"
-                        }
-                    );
                     let action = if session.current {
-                        PickAction::Official(session.id)
+                        PickAction::Official(session.id.clone())
                     } else {
                         PickAction::None
                     };
-                    rows.push((label, action));
+                    let mut choice = Choice::new(
+                        session.title.as_deref().unwrap_or("Untitled session"),
+                        action,
+                    );
+                    choice.item.subtitle = screen::project(&session.cwd).to_owned();
+                    choice.item.state = if session.current {
+                        session.date.clone()
+                    } else {
+                        "Older format".into()
+                    };
+                    choice.detail = format!(
+                        "{}\n{}\n{}\nSession ID: {}",
+                        choice.item.title, session.cwd, session.date, session.id
+                    );
+                    rows.push(choice);
                 }
             }
-            for id in local?.sessions()? {
-                if !rows.iter().any(
-                    |(_, action)| matches!(action, PickAction::Official(found) if *found == id),
+            for (id, title) in local?.sessions()? {
+                if let Some(choice) = rows.iter_mut().find(
+                    |choice| matches!(&choice.action, PickAction::Official(found) if *found == id),
                 ) {
-                    rows.push((format!("{id}  · TUI"), PickAction::Local(id)));
+                    if let Some(title) = title.filter(|_| choice.item.title == "Untitled session") {
+                        choice.detail = choice.detail.replacen("Untitled session", &title, 1);
+                        choice.item.title = title;
+                    }
+                } else {
+                    let mut choice = Choice::new(
+                        title.unwrap_or_else(|| "Untitled session".into()),
+                        PickAction::Local(id.clone()),
+                    );
+                    choice.item.subtitle = "Local Host".into();
+                    choice.detail = format!(
+                        "{}\nLocal Host archive\nSession ID: {id}",
+                        choice.item.title
+                    );
+                    rows.push(choice);
                 }
             }
             Ok(rows)
@@ -676,8 +845,16 @@ impl App {
             return;
         };
         let (title, mut rows) = inventory_rows(kind, &inventory);
-        if kind == "models" && !rows.iter().any(|(_, action)| matches!(action, PickAction::Route(p, m) if *p == config.provider && *m == config.model)) {
-            rows.insert(0, (format!("{} / {} · current", config.provider, config.model), PickAction::Route(config.provider.clone(), config.model.clone())));
+        self.inventory = summarize_inventory(&inventory);
+        if kind == "models" {
+            if let Some(choice) = rows.iter_mut().find(|choice| matches!(&choice.action, PickAction::Route(p, m) if *p == config.provider && *m == config.model)) {
+                choice.item.state = "Current".into();
+            } else {
+                let mut choice = Choice::new(config.model.clone(), PickAction::Route(config.provider.clone(), config.model.clone()));
+                choice.item.group.clone_from(&config.provider);
+                choice.item.state = "Current".into();
+                rows.insert(0, choice);
+            }
         }
         self.overlay = Some(Overlay::Inventory(Picker::new(title, Some(rows))));
     }
@@ -735,13 +912,31 @@ impl App {
         match words.as_slice() {
             ["/quit"] => self.quit = true,
             ["/help"] => self.overlay = Some(Overlay::Help),
+            ["/sidebar"] => self.toggle_sidebar(),
+            ["/debug"] => self.debug(None, false),
+            ["/details"] => {
+                let id = self.id();
+                let title = self
+                    .conversation
+                    .sessions
+                    .get(id)
+                    .and_then(|s| s.title.as_deref())
+                    .unwrap_or("Untitled session");
+                self.overlay = Some(Overlay::Details(
+                    format!(
+                        "{title}\nProject directory: {}\nRuntime: {}\nSession ID: {id}",
+                        self.cwd, self.version
+                    ),
+                    None,
+                ));
+            }
             ["/settings"] => {
                 let mut picker = Picker::new(
                     " Settings · Tool detail ",
                     Some(
                         [Mode::Compact, Mode::Normal, Mode::Verbose]
                             .into_iter()
-                            .map(|mode| (mode.label().into(), PickAction::Mode(mode)))
+                            .map(|mode| Choice::new(mode.label(), PickAction::Mode(mode)))
                             .collect(),
                     ),
                 );
@@ -776,8 +971,12 @@ impl App {
             ["/new"] => {
                 self.session = new_session();
                 self.attached = false;
-                if let Some(config) = &self.config {
-                    self.cwd = config.cwd.to_string_lossy().into_owned();
+                if let Some(cwd) = self
+                    .config
+                    .as_ref()
+                    .map(|config| config.cwd.to_string_lossy().into_owned())
+                {
+                    self.set_cwd(&cwd);
                 }
                 self.viewed = None;
                 self.viewport.reset();
@@ -785,7 +984,7 @@ impl App {
             }
             ["/resume", id] => self.resume((*id).into()),
             ["/history"] => self.open_history(),
-            [kind @ ("/models" | "/plugins" | "/skills" | "/mcp")] => {
+            [kind @ ("/models" | "/providers" | "/plugins" | "/skills" | "/mcp")] => {
                 self.open_inventory(&kind[1..])
             }
             ["/cwd"] => {
@@ -819,7 +1018,11 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if (!self.interactions.is_empty() || matches!(self.overlay, Some(Overlay::Help)))
+        if (!self.interactions.is_empty()
+            || matches!(
+                self.overlay,
+                Some(Overlay::Help | Overlay::Details(..) | Overlay::Debug { .. })
+            ))
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
         {
             self.modal_scroll = if key.code == KeyCode::PageUp {
@@ -845,7 +1048,29 @@ impl App {
         }
         if let Some(overlay) = &mut self.overlay {
             if key.code == KeyCode::Esc || ctrl && key.code == KeyCode::Char('c') {
-                self.overlay = None;
+                self.overlay = match self.overlay.take() {
+                    Some(Overlay::Details(_, Some(picker))) => Some(Overlay::History { picker }),
+                    _ => None,
+                };
+                self.modal_scroll = 0;
+            } else if let Overlay::Debug { seq, .. } = overlay {
+                let seq = *seq;
+                if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                    self.debug(seq, key.code == KeyCode::Right);
+                }
+            } else if key.code == KeyCode::F(2) && matches!(overlay, Overlay::History { .. }) {
+                if let Some(Overlay::History { picker }) = self.overlay.take() {
+                    let detail = picker
+                        .matches()
+                        .nth(picker.selected)
+                        .map(|choice| choice.detail.clone());
+                    self.overlay = if let Some(detail) = detail {
+                        self.modal_scroll = 0;
+                        Some(Overlay::Details(detail, Some(picker)))
+                    } else {
+                        Some(Overlay::History { picker })
+                    };
+                }
             } else if let Overlay::History { picker }
             | Overlay::Inventory(picker)
             | Overlay::Settings(picker) = overlay
@@ -893,7 +1118,9 @@ impl App {
                         .iter()
                         .filter(|(_, _, offline)| !self.offline || *offline)
                         .map(|&(cmd, label, _)| {
-                            (format!("{cmd:<22} {label}"), PickAction::Command(cmd))
+                            let mut choice = Choice::new(label, PickAction::Command(cmd));
+                            choice.item.subtitle = cmd.into();
+                            choice
                         })
                         .collect(),
                 ),
@@ -902,6 +1129,10 @@ impl App {
             self.viewport.mode = self.viewport.mode.next();
         } else if key.code == KeyCode::F(6) {
             self.viewport.focused = !self.viewport.focused;
+        } else if key.code == KeyCode::F(7) {
+            self.toggle_sidebar();
+        } else if key.code == KeyCode::F(1) {
+            self.command("/details").await;
         } else if key.code == KeyCode::Esc {
             if self.viewed.take().is_some() {
                 self.viewport.reset();

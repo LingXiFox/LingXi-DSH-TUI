@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 
-use dsh_state::conversation::{Conversation, Row, Session};
+use dsh_state::conversation::{Conversation, Row, Session, TextKind};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -62,6 +62,7 @@ pub struct Viewport {
     groups: HashMap<(String, u64), bool>,
     tools: HashMap<(String, u64, String), bool>,
     children: HashSet<(String, String)>,
+    messages: HashSet<(String, usize)>,
     layouts: VecDeque<Layout>,
     fences: VecDeque<(Weak<String>, Vec<usize>)>,
     layout_bytes: usize,
@@ -75,6 +76,7 @@ struct Layout {
     chunk: usize,
     width: u16,
     markdown: bool,
+    preview: bool,
     lines: Vec<Line<'static>>,
     bytes: usize,
 }
@@ -83,6 +85,7 @@ struct Piece {
     body: Arc<String>,
     color: Color,
     markdown: bool,
+    preview: bool,
 }
 
 impl Piece {
@@ -91,6 +94,7 @@ impl Piece {
             body: body.into(),
             color,
             markdown: false,
+            preview: false,
         }
     }
 }
@@ -118,14 +122,14 @@ impl Viewport {
         if !self.focused
             && !matches!(
                 session.rows.get(self.selected.row),
-                Some(Row::Tools(_) | Row::Child(_))
+                Some(Row::ToolActivity(_) | Row::SubAgent(_))
             )
         {
             if let Some(pos) = self.painted.iter().rev().find(|pos| {
                 pos.part == 0
                     && matches!(
                         session.rows.get(pos.row),
-                        Some(Row::Tools(_) | Row::Child(_))
+                        Some(Row::ToolActivity(_) | Row::SubAgent(_))
                     )
             }) {
                 self.selected = *pos;
@@ -134,7 +138,7 @@ impl Viewport {
         self.focused = true;
         let pos = self.selected;
         match session.rows.get(pos.row) {
-            Some(Row::Tools(turn)) => {
+            Some(Row::ToolActivity(turn)) => {
                 let group = (id.to_owned(), *turn);
                 if pos.part == 0 {
                     self.groups.insert(group, !self.group_open(id, *turn));
@@ -142,7 +146,7 @@ impl Viewport {
                         row: pos.row,
                         ..Position::default()
                     };
-                } else if let Some(tool) = session.turns[turn].tools.get((pos.part - 1) / 4) {
+                } else if let Some(tool) = session.activity[turn].tools.get((pos.part - 1) / 4) {
                     let key = (id.to_owned(), *turn, tool.id.clone());
                     let open = self
                         .tools
@@ -158,12 +162,23 @@ impl Viewport {
                 }
                 self.top = Some(self.selected);
             }
-            Some(Row::Child(child)) => {
+            Some(Row::SubAgent(child)) => {
                 flip(&mut self.children, (id.to_owned(), child.clone()));
                 self.top = Some(Position {
                     row: pos.row,
                     ..Position::default()
                 });
+            }
+            Some(Row::Text {
+                kind: TextKind::UserMessage | TextKind::Reasoning,
+                ..
+            }) => {
+                flip(&mut self.messages, (id.to_owned(), pos.row));
+                self.selected = Position {
+                    row: pos.row,
+                    ..Position::default()
+                };
+                self.top = Some(self.selected);
             }
             _ => {}
         }
@@ -181,10 +196,10 @@ impl Viewport {
         else {
             return false;
         };
-        let Row::Tools(turn) = session.rows[row] else {
+        let Row::ToolActivity(turn) = session.rows[row] else {
             return false;
         };
-        let tool = &session.turns[&turn].tools[call];
+        let tool = &session.activity[&turn].tools[call];
         self.groups.insert((id.into(), turn), true);
         self.tools.insert((id.into(), turn, tool.id.clone()), true);
         self.selected = Position {
@@ -254,6 +269,9 @@ impl Viewport {
                 .is_some()
         {
             self.reset();
+            self.messages.retain(|(session, _)| session != id);
+            self.groups.retain(|(session, _), _| session != id);
+            self.tools.retain(|(session, _, _), _| session != id);
         }
         // Keep the same row and text chunk across resize, even if wrapping changes.
         if self.size.0 != width {
@@ -294,7 +312,12 @@ impl Viewport {
                 .painted
                 .iter()
                 .rev()
-                .find(|pos| matches!(session.rows[pos.row], Row::Tools(_) | Row::Child(_)))
+                .find(|pos| {
+                    matches!(
+                        session.rows[pos.row],
+                        Row::ToolActivity(_) | Row::SubAgent(_)
+                    )
+                })
                 .or_else(|| self.painted.last())
                 .copied()
                 .unwrap_or_default();
@@ -318,11 +341,22 @@ impl Viewport {
 
     fn parts(&self, id: &str, session: &Session, row: usize) -> usize {
         match &session.rows[row] {
-            Row::Text { .. } => 2,
-            Row::Tools(turn) if self.group_open(id, *turn) => {
-                1 + 4 * session.turns[turn].tools.len()
+            Row::Text {
+                kind: TextKind::UserMessage,
+                ..
+            } => 3,
+            Row::Text {
+                kind: TextKind::AssistantMessage,
+                ..
+            } => 2,
+            Row::Text {
+                kind: TextKind::Reasoning,
+                ..
+            } if self.messages.contains(&(id.to_owned(), row)) => 2,
+            Row::ToolActivity(turn) if self.group_open(id, *turn) => {
+                1 + 4 * session.activity[turn].tools.len()
             }
-            Row::Child(child) if self.children.contains(&(id.into(), child.clone())) => 2,
+            Row::SubAgent(child) if self.children.contains(&(id.into(), child.clone())) => 2,
             _ => 1,
         }
     }
@@ -335,26 +369,39 @@ impl Viewport {
         pos: Position,
     ) -> Option<Piece> {
         Some(match &session.rows[pos.row] {
-            Row::Text { label, .. } if pos.part == 0 => Piece::new(
-                match *label {
-                    "You" => "▏ You".into(),
-                    "Assistant" => "▏ Assistant".into(),
-                    _ => label.to_string(),
-                },
-                match *label {
-                    "You" => super::screen::ACCENT,
-                    "Error" => Color::LightRed,
-                    "Assistant" => Color::Reset,
-                    _ => Color::DarkGray,
-                },
-            ),
-            Row::Text { body, .. } => Piece {
-                body: load_body(conversation, body),
-                color: Color::Reset,
-                markdown: true,
-            },
-            Row::Tools(turn) if pos.part == 0 => {
-                let group = &session.turns[turn];
+            Row::Text { kind, body } => {
+                let open = matches!(kind, TextKind::UserMessage | TextKind::Reasoning)
+                    && self.messages.contains(&(id.to_owned(), pos.row));
+                match (*kind, pos.part) {
+                    (TextKind::UserMessage, 0) => {
+                        Piece::new("▏ You".to_owned(), super::theme::ACCENT)
+                    }
+                    (TextKind::UserMessage, 2) | (TextKind::AssistantMessage, 1) => {
+                        Piece::new(String::new(), Color::Reset)
+                    }
+                    (TextKind::UserMessage, _) | (TextKind::AssistantMessage, _) => Piece {
+                        body: load_body(conversation, body),
+                        color: Color::Reset,
+                        markdown: *kind == TextKind::AssistantMessage,
+                        preview: *kind == TextKind::UserMessage && !open,
+                    },
+                    (TextKind::Reasoning, 0) => Piece::new(
+                        if open {
+                            "▾ Reasoning"
+                        } else {
+                            "▸ Reasoning"
+                        }
+                        .to_owned(),
+                        Color::DarkGray,
+                    ),
+                    (TextKind::Error, _) => {
+                        Piece::new(load_body(conversation, body), Color::LightRed)
+                    }
+                    _ => Piece::new(load_body(conversation, body), Color::Gray),
+                }
+            }
+            Row::ToolActivity(turn) if pos.part == 0 => {
+                let group = &session.activity[turn];
                 let mark = if self.group_open(id, *turn) {
                     "▾"
                 } else {
@@ -364,16 +411,41 @@ impl Viewport {
                     .counts
                     .iter()
                     .take(6)
-                    .map(|(name, count)| format!("{name} {count}"))
+                    .map(|(name, count)| {
+                        let mut chars = name.chars();
+                        let first = chars
+                            .next()
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_default();
+                        format!("{first}{} {count}", chars.as_str())
+                    })
                     .collect::<Vec<_>>()
                     .join(" · ");
+                let status = if group.running > 0 {
+                    "◉"
+                } else if group.failed > 0 {
+                    "×"
+                } else if group.interrupted > 0 {
+                    "–"
+                } else {
+                    "✓"
+                };
+                let count = group.tools.len();
+                let mut label = format!(
+                    "{mark} {status} {count} {}",
+                    if count == 1 { "tool" } else { "tools" }
+                );
+                if group.running > 0 {
+                    label.push_str(&format!(" · {} running", group.running));
+                }
+                if group.failed > 0 {
+                    label.push_str(&format!(" · {} failed", group.failed));
+                }
+                if !counts.is_empty() {
+                    label.push_str(&format!(" · {counts}"));
+                }
                 Piece::new(
-                    format!(
-                        "{mark} Turn {turn} · {} tools · {} running · {} failed · {counts}",
-                        group.tools.len(),
-                        group.running,
-                        group.failed
-                    ),
+                    label,
                     if group.failed == 0 {
                         Color::Gray
                     } else {
@@ -381,8 +453,8 @@ impl Viewport {
                     },
                 )
             }
-            Row::Tools(turn) => {
-                let calls = &session.turns[turn].tools;
+            Row::ToolActivity(turn) => {
+                let calls = &session.activity[turn].tools;
                 let index = (pos.part - 1) / 4;
                 let tool = &calls[index];
                 let open = self
@@ -406,7 +478,9 @@ impl Viewport {
                         } else {
                             &tool.name
                         };
-                        let args = excerpt(&load_body(conversation, &tool.arguments), 110);
+                        let args = tool.path.clone().unwrap_or_else(|| {
+                            excerpt(&load_body(conversation, &tool.arguments), 100)
+                        });
                         let step = match tool.step {
                             Some(step)
                                 if matches!(self.mode, Mode::Normal)
@@ -418,9 +492,8 @@ impl Viewport {
                         };
                         Piece::new(
                             format!(
-                                "{step}  {} {name} · {status} · {}  {args}",
-                                if open { "▾" } else { "▸" },
-                                tool.id
+                                "{step}  {} {name} · {status}  {args}",
+                                if open { "▾" } else { "▸" }
                             ),
                             if tool.failed {
                                 Color::LightRed
@@ -435,10 +508,11 @@ impl Viewport {
                     2 if open => {
                         Piece::new(load_body(conversation, tool.output.as_ref()?), Color::Reset)
                     }
-                    2 if matches!(self.mode, Mode::Normal) => Piece::new(
-                        excerpt(&load_body(conversation, tool.output.as_ref()?), 240),
-                        Color::DarkGray,
-                    ),
+                    2 => {
+                        let output = tool.output.as_ref().or(tool.error.as_ref())?;
+                        let preview = excerpt(&load_body(conversation, output), 160);
+                        Piece::new(format!("    {preview}"), super::theme::MUTED)
+                    }
                     3 if open => Piece::new(
                         load_body(conversation, tool.error.as_ref()?),
                         Color::LightRed,
@@ -446,7 +520,7 @@ impl Viewport {
                     _ => return None,
                 }
             }
-            Row::Child(child) => {
+            Row::SubAgent(child) => {
                 let child_state = conversation.sessions.get(child)?;
                 if pos.part == 0 {
                     let open = self.children.contains(&(id.into(), child.clone()));
@@ -466,7 +540,7 @@ impl Viewport {
                     let mut summary = format!(
                         "{} rows · {} tool turns · /view {child}",
                         child_state.rows.len(),
-                        child_state.turns.len()
+                        child_state.activity.len()
                     );
                     if let Some(body) = &child_state.summary {
                         summary.push('\n');
@@ -487,9 +561,7 @@ impl Viewport {
     ) -> Option<(Position, Line<'static>)> {
         pos.part = pos.part.min(self.parts(id, session, pos.row) - 1);
         let piece = self.piece(id, conversation, session, pos)?;
-        pos.chunk = pos
-            .chunk
-            .min(piece.body.len().saturating_sub(1) / CHUNK_BYTES);
+        pos.chunk = pos.chunk.min(last_chunk(&piece));
         let lines = self.layout(&piece, pos.chunk);
         pos.line = pos.line.min(lines.len() - 1);
         Some((pos, lines[pos.line].clone().fg(piece.color)))
@@ -505,7 +577,7 @@ impl Viewport {
     ) -> Option<Position> {
         pos.part = pos.part.min(self.parts(id, session, pos.row) - 1);
         if let Some(piece) = self.piece(id, conversation, session, pos) {
-            let last = piece.body.len().saturating_sub(1) / CHUNK_BYTES;
+            let last = last_chunk(&piece);
             pos.chunk = pos.chunk.min(last);
             let len = self.layout(&piece, pos.chunk).len();
             pos.line = pos.line.min(len - 1);
@@ -558,6 +630,7 @@ impl Viewport {
             Weak::ptr_eq(&entry.body, &body)
                 && entry.width == width
                 && entry.markdown == piece.markdown
+                && entry.preview == piece.preview
                 && entry.chunk == chunk
         }) {
             return &self.layouts[index].lines;
@@ -568,13 +641,17 @@ impl Viewport {
             ((chunk + 1) * CHUNK_BYTES).min(piece.body.len()),
         );
         let in_fence = piece.markdown && start > 0 && self.in_fence(&piece.body, start);
-        let lines = wrap(
+        let mut lines = wrap(
             &piece.body[start..end],
             usize::from(width),
             piece.markdown,
             in_fence,
             start == 0 || piece.body.as_bytes()[start - 1] == b'\n',
         );
+        if piece.preview && (lines.len() > 8 || end < piece.body.len()) {
+            lines.truncate(8);
+            lines.push(Line::from("… Tab to expand prompt").fg(Color::DarkGray));
+        }
         let bytes = lines.capacity() * size_of::<Line<'static>>()
             + lines
                 .iter()
@@ -599,6 +676,7 @@ impl Viewport {
             chunk,
             width,
             markdown: piece.markdown,
+            preview: piece.preview,
             lines,
             bytes,
         });
@@ -654,6 +732,14 @@ impl Viewport {
             &self.fences[self.fences.len() - 1].1
         };
         fences.partition_point(|offset| *offset < at) % 2 != 0
+    }
+}
+
+fn last_chunk(piece: &Piece) -> usize {
+    if piece.preview {
+        0
+    } else {
+        piece.body.len().saturating_sub(1) / CHUNK_BYTES
     }
 }
 
