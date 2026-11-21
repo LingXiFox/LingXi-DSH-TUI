@@ -58,10 +58,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # --slurp merges every page into one array so the JSON stays valid.
+          # --slurp returns one array per page; flatten before normalising.
           gh api --paginate --slurp "repos/$UPSTREAM_REPO/releases?per_page=100" \
-            --jq '[.[] | {tag_name, prerelease, draft, published_at, html_url}]' \
-            > "$RUNNER_TEMP/releases.json"
+            > "$RUNNER_TEMP/releases-pages.json"
+          jq '[.[][] | {tag_name, prerelease, draft, published_at, html_url}]' \
+            "$RUNNER_TEMP/releases-pages.json" > "$RUNNER_TEMP/releases.json"
           jq 'length' "$RUNNER_TEMP/releases.json" | xargs -I{} echo "releases seen: {}"
 
       - name: Compare against the pinned version
