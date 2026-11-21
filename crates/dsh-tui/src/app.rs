@@ -29,20 +29,38 @@ pub async fn run(state: AppState) -> io::Result<()> {
     result
 }
 
+/// Interval the reader blocks for before checking whether the UI is gone.
+const INPUT_POLL: Duration = Duration::from_millis(100);
+
 /// Spawn the blocking reader that pumps crossterm events into `sender`.
+///
+/// The reader polls instead of blocking in `read` forever: when the event loop
+/// drops the receiver the thread notices within one poll interval and returns,
+/// so shutdown never waits on a terminal event that will not arrive.
 fn spawn_input_reader(sender: mpsc::Sender<Event>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("dsh-tui-input".into())
         .spawn(move || {
             loop {
-                match crossterm::event::read() {
-                    Ok(event) => {
-                        if sender.blocking_send(event).is_err() {
+                match crossterm::event::poll(INPUT_POLL) {
+                    Ok(true) => match crossterm::event::read() {
+                        Ok(event) => {
+                            if sender.blocking_send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "input reader stopped");
+                            break;
+                        }
+                    },
+                    Ok(false) => {
+                        if sender.is_closed() {
                             break;
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "input reader stopped");
+                        tracing::warn!(%error, "input poll failed");
                         break;
                     }
                 }
