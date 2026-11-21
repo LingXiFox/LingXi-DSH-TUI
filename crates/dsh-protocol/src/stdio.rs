@@ -3,6 +3,7 @@
 use std::io::{self, BufRead, Read, Write};
 
 use crate::protocol::{ClientMethod, Frame, InitializeParams, JsonRpcId, Request};
+use serde_json::Value;
 
 /// Maximum encoded frame size accepted by the host, including its newline.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -48,23 +49,36 @@ pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> io::Result<()> {
 
 /// Construct the official initialization request.
 pub fn initialize_request(id: JsonRpcId, params: &InitializeParams) -> Frame {
-    Frame::Request(Request {
-        jsonrpc: "2.0".into(),
+    request(
         id,
-        method: ClientMethod::Initialize.as_str().into(),
-        // Every field in InitializeParams has an infallible JSON representation.
-        params: Some(serde_json::json!(params)),
-    })
+        ClientMethod::Initialize,
+        Some(serde_json::json!(params)),
+    )
 }
 
 /// Construct the official process shutdown request.
 pub fn shutdown_request(id: JsonRpcId) -> Frame {
+    request(id, ClientMethod::Shutdown, None)
+}
+
+/// Build an SDK request using a method from the pinned contract.
+pub fn request(id: JsonRpcId, method: ClientMethod, params: Option<Value>) -> Frame {
     Frame::Request(Request {
         jsonrpc: "2.0".into(),
         id,
-        method: ClientMethod::Shutdown.as_str().into(),
-        params: None,
+        method: method.as_str().into(),
+        params,
     })
+}
+
+/// Common parameters for resume, wait, and working-directory lookup.
+pub fn session_params(session_id: &str) -> Value {
+    serde_json::json!({"sessionId": session_id})
+}
+
+/// Submit the composed text using the official content-block shape.
+pub fn prompt_params(session_id: &str, text: &str) -> Value {
+    serde_json::json!({"sessionId": session_id, "contentBlocks": [{"type": "text", "text": text}]})
 }
 
 #[cfg(test)]

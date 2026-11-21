@@ -1,6 +1,6 @@
 //! Wire shapes for the DSH SDK JSON-RPC protocol (newline-delimited JSON-RPC 2.0).
 //!
-//! The host uses these envelopes for initialization and bounded shutdown.
+//! The host uses these envelopes for SDK calls and interactions.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,6 +28,22 @@ pub enum JsonRpcId {
     String(String),
     /// Numeric IDs are also accepted by the official transport.
     Number(serde_json::Number),
+}
+
+impl From<u64> for JsonRpcId {
+    fn from(id: u64) -> Self {
+        Self::Number(id.into())
+    }
+}
+
+impl JsonRpcId {
+    /// Recover an ID allocated by this host.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Number(id) => id.as_u64(),
+            Self::String(_) => None,
+        }
+    }
 }
 
 /// A JSON-RPC request frame.
@@ -64,6 +80,30 @@ pub struct Response {
 }
 
 impl Response {
+    /// Send the decision for an SDK-initiated request.
+    pub fn success(id: JsonRpcId, result: Value) -> Frame {
+        Frame::Response(Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: Some(result),
+            error: None,
+        })
+    }
+
+    /// Reject an unsupported or invalid SDK-initiated request.
+    pub fn failure(id: JsonRpcId, code: i64, message: impl Into<String>) -> Frame {
+        Frame::Response(Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(ErrorObject {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        })
+    }
+
     /// Decode a successful response payload or preserve the remote error.
     pub fn decode_result<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
         if let Some(error) = self.error {
@@ -235,6 +275,9 @@ impl ServerNotification {
 
 /// Server-to-client request method enabled by `initialize.approvalRequests`.
 pub const METHOD_APPROVAL_REQUEST: &str = "approval/request";
+
+/// Structured user interaction enabled by `initialize.capabilities`.
+pub const METHOD_USER_QUESTION: &str = "user-question/ask";
 
 /// `session.status` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

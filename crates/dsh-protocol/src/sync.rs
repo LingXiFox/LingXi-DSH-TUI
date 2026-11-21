@@ -167,6 +167,7 @@ pub fn expected_wire_names() -> Vec<&'static str> {
         names.push(method.as_str());
     }
     names.push(crate::protocol::METHOD_APPROVAL_REQUEST);
+    names.push(crate::protocol::METHOD_USER_QUESTION);
     names
 }
 
@@ -266,12 +267,13 @@ mod tests {
     #[test]
     fn expected_wire_names_matches_the_enums() {
         let names = expected_wire_names();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
         let mut unique = names.clone();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "wire names must be unique");
         assert!(names.contains(&"approval/request"));
+        assert!(names.contains(&"user-question/ask"));
         assert!(names.contains(&"session/working-directory/get"));
     }
 
