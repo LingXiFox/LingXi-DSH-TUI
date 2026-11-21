@@ -46,19 +46,16 @@ ENTRY=${ENTRY:-apps/cli/lib/bin.js}
 # Verify the checkout before spending minutes on a build.
 "$ROOT/scripts/check-runtime-pin.sh"
 
-# Resolve the declared package manager without guessing. corepack honours the
-# packageManager field exactly; an already-installed pnpm self-manages its version
-# from that same field, so a newer launcher still runs the locked release.
-PM_BIN=""
+# Resolve the declared package manager. corepack, when present, installs shims that
+# honour the repo's packageManager field exactly; an already-installed pnpm also
+# self-manages that version. Both paths end with a plain binary name on PATH.
+name=${PACKAGE_MANAGER%@*}
 if command -v corepack >/dev/null 2>&1; then
     corepack enable >/dev/null 2>&1 || true
-    PM_BIN=$PACKAGE_MANAGER
-else
-    name=${PACKAGE_MANAGER%@*}
-    command -v "$name" >/dev/null 2>&1 \
-        || fail "needs corepack or $PACKAGE_MANAGER on PATH; install Node.js >= 24.9.0"
-    PM_BIN=$name
 fi
+command -v "$name" >/dev/null 2>&1 \
+    || fail "needs corepack or $PACKAGE_MANAGER on PATH; install Node.js >= 24.9.0"
+PM_BIN=$name
 
 cd "$SUBMODULE"
 
