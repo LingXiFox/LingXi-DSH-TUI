@@ -1,0 +1,164 @@
+name: Release
+
+# Structure only. Publishing is a manual, tag-driven action and is deliberately
+# not wired to the upstream sync. Users are never upgraded because upstream
+# shipped something; they upgrade when this repository publishes a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and package everything, publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check out the pinned runtime commit
+        run: git submodule update --init --depth 1 runtime/upstream
+
+      - name: Collect the versions this build would publish
+        id: version
+        run: |
+          set -euo pipefail
+          ./scripts/check-runtime-pin.sh
+          cargo run --quiet --locked -p dsh-protocol --bin dsh-runtime-lock -- check
+          version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "dsh-tui") | .version')
+          commit=$(sed -n 's/^commit = "\(.*\)"/\1/p' runtime/upstream.lock.toml | head -1)
+          {
+            echo "value=$version"
+            echo "tag=v$version"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+          echo "TUI version $version bundles DSH at $commit"
+
+      - name: Refuse to reuse a published tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Published tags are immutable: a UI fix bumps the build id, never the
+          # version, and an already published tag is never overwritten.
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "::error title=Tag already published::$TAG exists; bump the runtime pin or use a build id instead of re-releasing."
+            exit 1
+          fi
+          echo "$TAG is free to publish"
+
+  package:
+    name: package (${{ matrix.os }})
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check out the pinned runtime commit
+        run: git submodule update --init --depth 1 runtime/upstream
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "11.28.5"
+
+      - name: Build the bundled runtime
+        run: ./scripts/build-runtime.sh
+
+      - name: Build the TUI
+        env:
+          DSH_TUI_BUILD_ID: ${{ needs.preflight.outputs.commit }}
+        run: cargo build --release --locked -p dsh-tui
+
+      - name: Assemble the bundle
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: ./scripts/package.sh "$VERSION"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lingxi-dsh-tui-${{ matrix.os }}-${{ needs.preflight.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [preflight, package]
+    # Publishing only happens on an explicit, non-dry-run dispatch.
+    if: inputs.dry_run != true
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Record the bundled runtime in the release notes
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: |
+          set -euo pipefail
+          {
+            echo "LingXi DSH-TUI $VERSION"
+            echo
+            echo "Bundles the official DeepSeek Harness runtime at commit \`$COMMIT\`."
+            echo "Users never fetch or upgrade the runtime themselves; it ships in this bundle."
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          case "$VERSION" in
+            *-rc.*|*-alpha.*|*-beta.*) prerelease_flag="--prerelease" ;;
+          esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "LingXi DSH-TUI $VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            $prerelease_flag dist/*

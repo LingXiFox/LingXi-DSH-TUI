@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/dsh-protocol", "crates/dsh-state", "crates/dsh-tui"]
+default-members = ["crates/dsh-tui"]
+
+[workspace.package]
+# Single source of truth lives in runtime/upstream.lock.toml. This value is kept
+# in sync by `cargo run -p dsh-protocol --bin dsh-runtime-lock -- set` and is
+# enforced by `dsh-runtime-lock verify` on every CI run.
+version = "0.2.2-rc.5"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/LingXiFox/LingXi-DSH-TUI"
+authors = ["LingXiFox"]
+publish = false
+
+[workspace.dependencies]
+dsh-protocol = { path = "crates/dsh-protocol" }
+dsh-state = { path = "crates/dsh-state" }
+
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "std", "env-filter"] }
+semver = "1.0.28"
+toml = "1.2.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

@@ -1,0 +1,13 @@
+[package]
+name = "dsh-state"
+description = "UI state, event projection, and message folding for the LingXi DSH TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dsh-protocol.workspace = true

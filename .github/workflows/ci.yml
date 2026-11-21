@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Never let a build fetch a newer runtime: the pin in runtime/upstream.lock.toml
+  # is the only thing that decides which Agent ships.
+  DSH_TUI_BUILD_ID: ${{ github.sha }}
+
+jobs:
+  format:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+
+  build:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --locked
+      - name: Version banner matches the lock file
+        run: ./target/debug/dsh-tui --version | tee /tmp/version.txt && grep -q "0.2.2-rc.5" /tmp/version.txt
+
+  pin:
+    name: runtime pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The submodule is pinned to a release tag; a shallow single-commit
+          # fetch is enough and keeps CI honest about what actually shipped.
+          submodules: false
+      - name: Check out the pinned runtime commit
+        run: git submodule update --init --depth 1 runtime/upstream
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Shell pin check (no cargo needed)
+        run: ./scripts/check-runtime-pin.sh
+      - name: Rust pin check (lock, workspace version, submodule, wire contract)
+        run: cargo run --locked -p dsh-protocol --bin dsh-runtime-lock -- check
+      - name: Update-script tests
+        run: cargo test --locked -p dsh-protocol --bin dsh-runtime-lock
+
+  scripts:
+    name: scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck scripts/*.sh
+      - name: Failure paths report the right reason
+        run: ./scripts/test-pin-guards.sh
+

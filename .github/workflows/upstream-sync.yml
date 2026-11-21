@@ -1,0 +1,570 @@
+name: Upstream sync
+
+# Tracks released DSH versions only (never default-branch commits). When a newer
+# release appears it moves the bundled runtime pin on a dedicated branch, verifies
+# the result, and opens a pull request for human review.
+#
+# Merging source is not releasing: this workflow never publishes anything. Release
+# stays a manual, tag-driven action in release.yml.
+
+on:
+  schedule:
+    # Every six hours, offset so it does not collide with the exact-hour spike.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Prepare and verify the upgrade branch but do not open a PR"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: deepseek-ai/deepseek-harness
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  detect:
+    name: detect new release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      updated: ${{ steps.select.outputs.updated }}
+      current: ${{ steps.select.outputs.current }}
+      tag: ${{ steps.select.outputs.tag }}
+      version: ${{ steps.select.outputs.version }}
+      prerelease: ${{ steps.select.outputs.prerelease }}
+      release_url: ${{ steps.select.outputs.release_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: List published releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # --slurp merges every page into one array so the JSON stays valid.
+          gh api --paginate --slurp "repos/$UPSTREAM_REPO/releases?per_page=100" \
+            --jq '[.[] | {tag_name, prerelease, draft, published_at, html_url}]' \
+            > "$RUNNER_TEMP/releases.json"
+          jq 'length' "$RUNNER_TEMP/releases.json" | xargs -I{} echo "releases seen: {}"
+
+      - name: Compare against the pinned version
+        id: select
+        run: |
+          set -euo pipefail
+          cargo run --quiet --locked -p dsh-protocol --bin dsh-runtime-lock -- \
+            select --releases "$RUNNER_TEMP/releases.json" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Summarise the decision
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.select.outputs.updated }}" = "true" ]; then
+            {
+              echo "### Newer DSH release found"
+              echo
+              echo "- pinned: \`${{ steps.select.outputs.current }}\`"
+              echo "- target: \`${{ steps.select.outputs.tag }}\` (${{ steps.select.outputs.version }})"
+              echo "- prerelease: ${{ steps.select.outputs.prerelease }}"
+              echo "- release: ${{ steps.select.outputs.release_url }}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### No newer release"
+              echo
+              echo "\`${{ steps.select.outputs.current }}\` is the newest published release."
+              echo "No upgrade branch and no pull request are created."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+  prepare:
+    name: prepare upgrade branch
+    needs: detect
+    if: needs.detect.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      branch: ${{ steps.branch.outputs.name }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      patch_state: ${{ steps.patches.outputs.state }}
+      contract_state: ${{ steps.contract.outputs.state }}
+      protocol_diff: ${{ steps.diff.outputs.summary }}
+      already_open: ${{ steps.dupe.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so the upgrade branch is based on the real main line.
+          fetch-depth: 0
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up variables
+        id: branch
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: echo "name=upstream/$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when this version already has an open PR
+        id: dupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          count=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --head "$BRANCH" --json number --jq 'length')
+          if [ "$count" != "0" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "An open pull request for $BRANCH already exists; not opening a duplicate."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve the release commit
+        if: steps.dupe.outputs.exists == 'false'
+        id: resolve
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Prefer the peeled tag object so annotated tags resolve to a commit.
+          sha=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/tags/$TAG^{}" | cut -f1)
+          if [ -z "$sha" ]; then
+            sha=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/tags/$TAG" | cut -f1)
+          fi
+          case "$sha" in
+            [0-9a-f][0-9a-f]*) ;;
+            *) echo "Could not resolve $TAG to a commit" >&2; exit 1 ;;
+          esac
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+          echo "resolved $TAG -> $sha"
+
+      - name: Move the runtime submodule to the release commit
+        if: steps.dupe.outputs.exists == 'false'
+        env:
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 runtime/upstream
+          git -C runtime/upstream fetch --depth 1 origin "$COMMIT"
+          git -C runtime/upstream checkout --detach "$COMMIT"
+          test "$(git -C runtime/upstream rev-parse HEAD)" = "$COMMIT"
+
+      - name: Update the lock file and workspace version
+        if: steps.dupe.outputs.exists == 'false'
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cargo run --quiet --locked -p dsh-protocol --bin dsh-runtime-lock -- \
+            set --tag "$TAG" --commit "$COMMIT"
+          # Keep Cargo.lock consistent with the bumped workspace version.
+          cargo metadata --format-version 1 > /dev/null
+          ./scripts/check-runtime-pin.sh
+
+      - name: Check patches still apply
+        if: steps.dupe.outputs.exists == 'false'
+        id: patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "state=none" >> "$GITHUB_OUTPUT"
+            echo "No patches are carried; nothing to re-verify."
+            exit 0
+          fi
+          failed=0
+          for patch in "${patches[@]}"; do
+            if git -C runtime/upstream apply --check "$(realpath "$patch")"; then
+              echo "$patch applies cleanly"
+            else
+              echo "$patch no longer applies" >&2
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "state=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "state=clean" >> "$GITHUB_OUTPUT"
+
+      - name: Record the protocol surface diff
+        if: steps.dupe.outputs.exists == 'false'
+        id: diff
+        env:
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          # The lock file was just rewritten, so HEAD still holds the old pin.
+          prev=$(git show HEAD:runtime/upstream.lock.toml | sed -n 's/^commit = "\(.*\)"/\1/p' | head -1)
+          git -C runtime/upstream fetch --depth 1 origin "$prev" 2>/dev/null || true
+          if git -C runtime/upstream cat-file -e "$prev" 2>/dev/null; then
+            stat=$(git -C runtime/upstream diff --stat "$prev" "$COMMIT" -- packages/sdk apps/cli/src | tail -8)
+          else
+            stat="previous commit $prev unavailable in the shallow clone; protocol diff not computed"
+          fi
+          {
+            echo "summary<<PROTOCOL_DIFF_EOF"
+            echo "$stat"
+            echo "PROTOCOL_DIFF_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check the wire contract against the Rust protocol crate
+        if: steps.dupe.outputs.exists == 'false'
+        id: contract
+        run: |
+          set -euo pipefail
+          if cargo run --quiet --locked -p dsh-protocol --bin dsh-runtime-lock -- contract; then
+            echo "state=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Commit the pin move
+        if: steps.dupe.outputs.exists == 'false'
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          git config user.name "lingxi-upstream-bot"
+          git config user.email "upstream-bot@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock runtime/upstream.lock.toml runtime/upstream
+          git commit -m "chore(runtime): sync DSH $TAG"
+          # Never force-push: a stale branch is a signal, not something to erase.
+          git push origin "HEAD:refs/heads/$BRANCH"
+  verify-rust:
+    name: verify rust workspace
+    needs: [detect, prepare]
+    if: needs.detect.outputs.updated == 'true' && needs.prepare.outputs.already_open == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      result: ${{ steps.gate.outputs.result }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.branch }}
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check out the pinned runtime commit
+        run: git submodule update --init --depth 1 runtime/upstream
+
+      - name: Build, lint and test the workspace
+        id: gate
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --all-targets
+          ./target/debug/dsh-tui --version
+          echo "result=passed" >> "$GITHUB_OUTPUT"
+
+  verify-runtime:
+    name: verify bundled runtime
+    needs: [detect, prepare]
+    if: needs.detect.outputs.updated == 'true' && needs.prepare.outputs.already_open == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      result: ${{ steps.gate.outputs.result }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.branch }}
+          submodules: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "11.28.5"
+
+      - name: Build the runtime from the pinned commit
+        id: gate
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 runtime/upstream
+          ./scripts/build-runtime.sh
+          entry=$(sed -n 's/^runtime_entry = "\(.*\)"/\1/p' runtime/upstream.lock.toml | head -1)
+          entry=${entry:-apps/cli/lib/bin.js}
+          # The bundled agent must report the version this repository claims.
+          node "runtime/upstream/$entry" --version
+          echo "result=passed" >> "$GITHUB_OUTPUT"
+
+  open-pr:
+    name: open upgrade pull request
+    needs: [detect, prepare, verify-rust, verify-runtime]
+    if: |
+      always() && needs.detect.outputs.updated == 'true'
+      && needs.prepare.outputs.already_open == 'false'
+      && needs.prepare.result == 'success'
+      && (github.event_name != 'workflow_dispatch' || github.event.inputs.dry_run != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      pr_number: ${{ steps.open.outputs.number }}
+      blocked: ${{ steps.gate.outputs.blocked }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Mint an App token when one is configured
+        id: app
+        if: ${{ secrets.SYNC_APP_ID != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - name: Choose the token
+        id: token
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_TOKEN" ]; then
+            { echo "value=$APP_TOKEN"; echo "origin=app"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "value=${{ github.token }}"; echo "origin=builtin"; } >> "$GITHUB_OUTPUT"
+            echo "::warning title=App token missing::SYNC_APP_ID / SYNC_APP_PRIVATE_KEY are not set, so the pull request is opened by GITHUB_TOKEN and its own pull_request workflows will not run. The checks inside this workflow still gate the merge."
+          fi
+
+      - name: Ensure the labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create runtime-sync --repo "$GITHUB_REPOSITORY" \
+            --color 0e8a16 --description "Automated DSH runtime pin move" --force
+          gh label create "runtime-sync/blocked" --repo "$GITHUB_REPOSITORY" \
+            --color d93f0b --description "Sync stopped: a verification gate failed" --force
+          gh label create "runtime-sync/failed" --repo "$GITHUB_REPOSITORY" \
+            --color b60205 --description "Sync could not be prepared or verified" --force
+
+      - name: Assemble the review gate
+        id: gate
+        env:
+          PATCH_STATE: ${{ needs.prepare.outputs.patch_state }}
+          CONTRACT_STATE: ${{ needs.prepare.outputs.contract_state }}
+          RUST_RESULT: ${{ needs.verify-rust.outputs.result }}
+          RUNTIME_RESULT: ${{ needs.verify-runtime.outputs.result }}
+        run: |
+          set -euo pipefail
+          blocked=""
+          [ "$PATCH_STATE" = "failed" ] && blocked="$blocked patches"
+          [ "$CONTRACT_STATE" != "ok" ] && blocked="$blocked protocol"
+          [ "$RUST_RESULT" != "passed" ] && blocked="$blocked rust"
+          [ "$RUNTIME_RESULT" != "passed" ] && blocked="$blocked runtime"
+          echo "blocked=$(echo "$blocked" | sed 's/^ *//')" >> "$GITHUB_OUTPUT"
+          echo "review gate: ${blocked:-clear}"
+
+      - name: Write the pull request body
+        env:
+          CURRENT: ${{ needs.detect.outputs.current }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          PRERELEASE: ${{ needs.detect.outputs.prerelease }}
+          RELEASE_URL: ${{ needs.detect.outputs.release_url }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          PATCH_STATE: ${{ needs.prepare.outputs.patch_state }}
+          CONTRACT_STATE: ${{ needs.prepare.outputs.contract_state }}
+          PROTOCOL_DIFF: ${{ needs.prepare.outputs.protocol_diff }}
+          RUST_RESULT: ${{ needs.verify-rust.outputs.result }}
+          RUNTIME_RESULT: ${{ needs.verify-runtime.outputs.result }}
+          BLOCKED: ${{ steps.gate.outputs.blocked }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Runtime pin move"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| current version | \`$CURRENT\` |"
+            echo "| target tag | \`$TAG\` |"
+            echo "| target version | \`$VERSION\` |"
+            echo "| prerelease | \`$PRERELEASE\` |"
+            echo "| commit | \`$COMMIT\` |"
+            echo "| release | $RELEASE_URL |"
+            echo
+            echo "## Verification"
+            echo
+            echo "| check | result |"
+            echo "| --- | --- |"
+            echo "| patches apply | \`$PATCH_STATE\` |"
+            echo "| wire contract | \`$CONTRACT_STATE\` |"
+            echo "| rust fmt/clippy/tests | \`$RUST_RESULT\` |"
+            echo "| bundled runtime build | \`$RUNTIME_RESULT\` |"
+            echo
+            if [ -n "$BLOCKED" ]; then
+              echo "> **Blocked:** $BLOCKED failed. Auto-merge is withheld for this pull request."
+              echo
+            fi
+            echo "## Protocol surface diff"
+            echo
+            echo '```'
+            echo "$PROTOCOL_DIFF"
+            echo '```'
+            echo
+            echo "## Human review checklist"
+            echo
+            echo "- [ ] the release notes hold no behaviour the TUI actually depends on"
+            echo "- [ ] \`cargo run -p dsh-protocol --bin dsh-runtime-lock -- contract\` is still green"
+            echo "- [ ] the client still never downloads or updates the runtime at startup"
+            echo "- [ ] this bump rewrites no published tag or release asset"
+            echo "- [ ] merging does not publish anything; release stays manual"
+            echo
+            echo "Workflow run: $RUN_URL"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+      - name: Open or refresh the pull request
+        id: open
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.value }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          BLOCKED: ${{ steps.gate.outputs.blocked }}
+        run: |
+          set -euo pipefail
+          title="chore(runtime): sync DSH $TAG"
+          number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+            --state all --json number --jq '.[0].number // ""')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/pr-body.md"
+            echo "refreshed pull request #$number"
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "$title" --body-file "$RUNNER_TEMP/pr-body.md" \
+              --label runtime-sync >/dev/null
+            number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+              --state all --json number --jq '.[0].number // ""')
+            echo "opened pull request #$number"
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          if [ -n "$BLOCKED" ]; then
+            gh pr edit "$number" --repo "$GITHUB_REPOSITORY" --add-label "runtime-sync/blocked"
+          fi
+  auto-merge:
+    name: auto-merge (gated)
+    needs: [detect, prepare, verify-rust, verify-runtime, open-pr]
+    # Off unless the repository variable AUTO_MERGE_UPSTREAM is set to true.
+    # Merging a source bump is not releasing it; release stays manual.
+    if: |
+      vars.AUTO_MERGE_UPSTREAM == 'true'
+      && needs.open-pr.outputs.blocked == ''
+      && needs.open-pr.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Inspect merge readiness
+        id: mergeable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.open-pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            # GitHub computes mergeability asynchronously; poll instead of guessing.
+            read -r mergeable state < <(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+              --json mergeable,mergeStateStatus --jq '.mergeable + " " + .mergeStateStatus')
+            echo "attempt $attempt: $mergeable / $state"
+            [ "$mergeable" != "UNKNOWN" ] && break
+            sleep 10
+          done
+          { echo "mergeable=$mergeable"; echo "state=$state"; } >> "$GITHUB_OUTPUT"
+
+      - name: Merge once every required check is green
+        if: steps.mergeable.outputs.mergeable == 'MERGEABLE' && steps.mergeable.outputs.state == 'CLEAN'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.open-pr.outputs.pr_number }}
+        run: gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --auto
+
+      - name: Withhold the merge and say why
+        if: steps.mergeable.outputs.mergeable != 'MERGEABLE' || steps.mergeable.outputs.state != 'CLEAN'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.open-pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          reason="mergeable=${{ steps.mergeable.outputs.mergeable }} state=${{ steps.mergeable.outputs.state }}"
+          echo "::warning title=Auto-merge withheld::pull request #$PR reports $reason; a human must take over."
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label "runtime-sync/blocked" || true
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
+            --body "Auto-merge withheld: the branch reports \`$reason\`. The previous runtime version stays active."
+
+  report-failure:
+    name: record a failed sync
+    needs: [detect, prepare, verify-rust, verify-runtime]
+    if: |
+      always() && needs.detect.outputs.updated == 'true'
+      && needs.prepare.outputs.already_open == 'false'
+      && (needs.prepare.result == 'failure' || needs.verify-rust.result == 'failure' || needs.verify-runtime.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Open or refresh one tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          CURRENT: ${{ needs.detect.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PATCH_STATE: ${{ needs.prepare.outputs.patch_state }}
+          CONTRACT_STATE: ${{ needs.prepare.outputs.contract_state }}
+          RUST_RESULT: ${{ needs.verify-rust.result }}
+          RUNTIME_RESULT: ${{ needs.verify-runtime.result }}
+        run: |
+          set -euo pipefail
+          gh label create "runtime-sync/failed" --repo "$GITHUB_REPOSITORY" \
+            --color b60205 --description "Sync could not be prepared or verified" --force
+          title="chore(runtime): sync DSH $TAG failed"
+          body=$(printf '%s\n' \
+            "The automated upgrade for \`$TAG\` could not be verified." \
+            "" \
+            "| check | result |" \
+            "| --- | --- |" \
+            "| patches apply | $PATCH_STATE |" \
+            "| wire contract | $CONTRACT_STATE |" \
+            "| rust fmt/clippy/tests | $RUST_RESULT |" \
+            "| bundled runtime build | $RUNTIME_RESULT |" \
+            "" \
+            "The previously pinned version \`$CURRENT\` stays active: nothing was merged and nothing was released." \
+            "" \
+            "Workflow run: $RUN_URL")
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number --jq '.[0].number // ""')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+            echo "appended to issue #$existing"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "$body" --label "runtime-sync/failed"
+          fi

@@ -1,0 +1,62 @@
+name: Runtime check
+
+# Proves the pinned runtime still installs, builds and speaks the version this
+# repository claims. Runs on demand and weekly so a pinned version cannot rot
+# silently (for example when the upstream registry drops an old dependency).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 5 * * 1"
+  push:
+    paths:
+      - "runtime/upstream.lock.toml"
+      - ".github/workflows/runtime-check.yml"
+      - "scripts/build-runtime.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build bundled runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "11.28.5"
+
+      - name: Check out the pinned runtime commit
+        run: git submodule update --init --depth 1 runtime/upstream
+
+      - name: Pin still matches the submodule
+        run: ./scripts/check-runtime-pin.sh
+
+      - name: Build the runtime from the pinned commit
+        run: ./scripts/build-runtime.sh
+
+      - name: Bundled agent reports the pinned version
+        run: ./scripts/smoke-runtime.sh
+
+      - name: The TUI's protocol crate still matches the wire contract
+        run: cargo run --quiet --locked -p dsh-protocol --bin dsh-runtime-lock -- contract

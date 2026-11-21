@@ -1,0 +1,6 @@
+[submodule "runtime/upstream"]
+	path = runtime/upstream
+	url = https://github.com/deepseek-ai/deepseek-harness.git
+	# The runtime is pinned to a release tag, so a shallow fetch of that single
+	# commit is enough. Never track the upstream default branch.
+	shallow = true

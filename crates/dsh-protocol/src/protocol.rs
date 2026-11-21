@@ -1,0 +1,395 @@
+//! Wire shapes for the DSH SDK JSON-RPC protocol (newline-delimited JSON-RPC 2.0).
+//!
+//! Round one ships the envelope plus the version handshake only. Session,
+//! prompt, tool and approval methods land in round two, once the bundled
+//! runtime is actually spawned; the envelope will not change then.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Seconds we allow a freshly spawned runtime to answer `initialize`.
+pub const DEFAULT_INITIALIZE_TIMEOUT_SECS: u64 = 10;
+
+/// One JSON-RPC 2.0 frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Frame {
+    /// A request: `id` + `method`.
+    Request(Request),
+    /// A response: `id` + `result` or `error`.
+    Response(Response),
+    /// A notification: `method` only.
+    Notification(Notification),
+}
+
+/// A JSON-RPC request frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Request {
+    /// Protocol version marker, always `"2.0"`.
+    pub jsonrpc: String,
+    /// Correlation id chosen by the caller.
+    pub id: u64,
+    /// Method name, e.g. `initialize`.
+    pub method: String,
+    /// Method parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+/// A JSON-RPC response frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Response {
+    /// Protocol version marker, always `"2.0"`.
+    pub jsonrpc: String,
+    /// Correlation id echoed from the request.
+    pub id: u64,
+    /// Successful payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// Failure payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorObject>,
+}
+
+/// A JSON-RPC notification frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Notification {
+    /// Protocol version marker, always `"2.0"`.
+    pub jsonrpc: String,
+    /// Method name, e.g. `session.event`.
+    pub method: String,
+    /// Notification parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+/// JSON-RPC error payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorObject {
+    /// Numeric error code.
+    pub code: i64,
+    /// Human-readable message.
+    pub message: String,
+    /// Optional structured detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+/// The `initialize` request payload we will send first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeParams {
+    /// Working directory recorded on every SDK-created session.
+    pub cwd: String,
+    /// Provider route every SDK-created agent runs on.
+    pub provider: String,
+    /// Model every SDK-created agent runs on.
+    pub model: String,
+    /// Optional adapter-owned reasoning effort for the selected route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Optional positive output-token cap inherited by created agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Force server-to-client `approval/request` calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_requests: Option<bool>,
+    /// Host-side capabilities we can answer.
+    #[serde(default)]
+    pub capabilities: ClientCapabilities,
+}
+
+/// Capability flags advertised during `initialize`.
+///
+/// Upstream names these `userQuestions` and `approvalRequests`; omission of
+/// `approvalRequests` leaves native in-process answerers in control, so the
+/// TUI sends `true` only once it can actually answer prompts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCapabilities {
+    /// Whether the client can answer `user-question/ask`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_questions: bool,
+}
+
+/// The `initialize` result payload, as far as we depend on it today.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InitializeResult {
+    /// Server identity block.
+    #[serde(rename = "serverInfo")]
+    pub server_info: ServerInfo,
+}
+
+/// Server identity reported by the runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerInfo {
+    /// Public name; expected to stay `deepseek-harness-sdk-runtime`.
+    pub name: String,
+    /// Runtime version; pre-release may report `0.0.1` and is not trusted by upstream clients.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Wire name the runtime reports for itself during `initialize`.
+pub const RUNTIME_SERVER_NAME: &str = "deepseek-harness-sdk-runtime";
+
+/// Method name for the handshake request.
+pub const METHOD_INITIALIZE: &str = "initialize";
+
+/// Client-to-server methods, mirroring upstream `HarnessSdkRequestMap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientMethod {
+    /// Process-wide handshake.
+    Initialize,
+    /// Enqueue one user turn on a session.
+    SessionPrompt,
+    /// Submit text through the ordinary-input/slash-command entry.
+    SessionQuery,
+    /// Restore a persisted session without prompting.
+    SessionResume,
+    /// Wait for a session and its descendants to finish.
+    SessionWait,
+    /// Read a session working directory.
+    SessionWorkingDirectoryGet,
+    /// Change a session working directory.
+    SessionWorkingDirectorySet,
+    /// Ask the runtime to exit.
+    Shutdown,
+}
+
+impl ClientMethod {
+    /// Wire name of the method.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Initialize => METHOD_INITIALIZE,
+            Self::SessionPrompt => "session/prompt",
+            Self::SessionQuery => "session/query",
+            Self::SessionResume => "session/resume",
+            Self::SessionWait => "session/wait",
+            Self::SessionWorkingDirectoryGet => "session/working-directory/get",
+            Self::SessionWorkingDirectorySet => "session/working-directory/set",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Server-to-client notification methods, mirroring upstream `HarnessSdkNotificationMap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerNotification {
+    /// One session-log event streamed as it is recorded.
+    SessionEvent,
+    /// Whole-agent idle/running transition for a session.
+    SessionStatus,
+    /// A command query finished.
+    SessionQueryCompleted,
+    /// An in-runtime child session was created.
+    SubagentStarted,
+    /// An in-process subagent run ended.
+    SubagentFinished,
+    /// A pending host question was cancelled.
+    UserQuestionCancelled,
+}
+
+impl ServerNotification {
+    /// Wire name of the notification.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionEvent => "session.event",
+            Self::SessionStatus => "session.status",
+            Self::SessionQueryCompleted => "session.query.completed",
+            Self::SubagentStarted => "subagent.started",
+            Self::SubagentFinished => "subagent.finished",
+            Self::UserQuestionCancelled => "user-question.cancelled",
+        }
+    }
+}
+
+/// Server-to-client request method enabled by `initialize.approvalRequests`.
+pub const METHOD_APPROVAL_REQUEST: &str = "approval/request";
+
+/// `session.status` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatusParams {
+    /// Session whose live agent changed status.
+    pub session_id: String,
+    /// The whole-agent state after the transition.
+    pub status: SessionStatusState,
+}
+
+/// Whole-agent lifecycle state reported by `session.status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStatusState {
+    /// No turn is active.
+    Idle,
+    /// A turn is being worked on.
+    Running,
+}
+
+impl Frame {
+    /// Classify a raw JSON value into a frame.
+    pub fn parse(value: &Value) -> Result<Self, FrameError> {
+        let has_id = value.get("id").is_some();
+        let has_method = value.get("method").is_some();
+        let value = value.clone();
+        match (has_id, has_method) {
+            (true, true) => serde_json::from_value(value)
+                .map(Self::Request)
+                .map_err(FrameError::Decode),
+            (true, false) => serde_json::from_value(value)
+                .map(Self::Response)
+                .map_err(FrameError::Decode),
+            (false, true) => serde_json::from_value(value)
+                .map(Self::Notification)
+                .map_err(FrameError::Decode),
+            (false, false) => Err(FrameError::Unclassified),
+        }
+    }
+}
+
+/// Frame decoding failures.
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    /// JSON did not match any frame shape.
+    #[error("malformed JSON-RPC frame: {0}")]
+    Decode(serde_json::Error),
+    /// Neither an id nor a method was present.
+    #[error("frame has neither id nor method")]
+    Unclassified,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn json(text: &str) -> Value {
+        serde_json::from_str(text).expect("valid json")
+    }
+
+    #[test]
+    fn classifies_requests_responses_and_notifications() {
+        assert!(matches!(
+            Frame::parse(&json(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)).unwrap(),
+            Frame::Request(_)
+        ));
+        assert!(matches!(
+            Frame::parse(&json(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)).unwrap(),
+            Frame::Response(_)
+        ));
+        assert!(matches!(
+            Frame::parse(&json(r#"{"jsonrpc":"2.0","method":"session.event"}"#)).unwrap(),
+            Frame::Notification(_)
+        ));
+        assert!(matches!(
+            Frame::parse(&json(r#"{"jsonrpc":"2.0"}"#)).unwrap_err(),
+            FrameError::Unclassified
+        ));
+    }
+
+    #[test]
+    fn error_response_round_trips() {
+        let frame = Frame::parse(&json(
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"nope"}}"#,
+        ))
+        .unwrap();
+        let Frame::Response(response) = frame else {
+            panic!("expected response")
+        };
+        assert_eq!(response.id, 7);
+        assert_eq!(response.error.unwrap().code, -32601);
+    }
+
+    #[test]
+    fn initialize_result_uses_camel_case_server_info() {
+        let result: InitializeResult = serde_json::from_value(json(
+            r#"{"serverInfo":{"name":"deepseek-harness-sdk-runtime","version":"0.0.1"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(result.server_info.name, RUNTIME_SERVER_NAME);
+    }
+
+    #[test]
+    fn requests_omit_null_params() {
+        let request = Request {
+            jsonrpc: "2.0".into(),
+            id: 3,
+            method: METHOD_INITIALIZE.into(),
+            params: None,
+        };
+        let text = serde_json::to_string(&request).unwrap();
+        assert!(!text.contains("params"));
+    }
+
+    #[test]
+    fn client_methods_match_upstream_wire_names() {
+        assert_eq!(ClientMethod::Initialize.as_str(), "initialize");
+        assert_eq!(ClientMethod::SessionPrompt.as_str(), "session/prompt");
+        assert_eq!(ClientMethod::SessionQuery.as_str(), "session/query");
+        assert_eq!(ClientMethod::SessionResume.as_str(), "session/resume");
+        assert_eq!(ClientMethod::SessionWait.as_str(), "session/wait");
+        assert_eq!(
+            ClientMethod::SessionWorkingDirectoryGet.as_str(),
+            "session/working-directory/get"
+        );
+        assert_eq!(
+            ClientMethod::SessionWorkingDirectorySet.as_str(),
+            "session/working-directory/set"
+        );
+        assert_eq!(ClientMethod::Shutdown.as_str(), "shutdown");
+        assert_eq!(METHOD_APPROVAL_REQUEST, "approval/request");
+    }
+
+    #[test]
+    fn notification_methods_match_upstream_wire_names() {
+        assert_eq!(ServerNotification::SessionEvent.as_str(), "session.event");
+        assert_eq!(ServerNotification::SessionStatus.as_str(), "session.status");
+        assert_eq!(
+            ServerNotification::SessionQueryCompleted.as_str(),
+            "session.query.completed"
+        );
+        assert_eq!(
+            ServerNotification::SubagentStarted.as_str(),
+            "subagent.started"
+        );
+        assert_eq!(
+            ServerNotification::SubagentFinished.as_str(),
+            "subagent.finished"
+        );
+        assert_eq!(
+            ServerNotification::UserQuestionCancelled.as_str(),
+            "user-question.cancelled"
+        );
+    }
+
+    #[test]
+    fn session_status_payload_matches_upstream_shape() {
+        let payload: SessionStatusParams =
+            serde_json::from_value(json(r#"{"sessionId":"s1","status":"running"}"#)).unwrap();
+        assert_eq!(payload.session_id, "s1");
+        assert_eq!(payload.status, SessionStatusState::Running);
+    }
+
+    #[test]
+    fn initialize_params_serialize_upstream_field_names() {
+        let params = InitializeParams {
+            cwd: "/tmp/project".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4".into(),
+            reasoning_effort: None,
+            max_tokens: None,
+            approval_requests: Some(true),
+            capabilities: ClientCapabilities {
+                user_questions: true,
+            },
+        };
+        let text = serde_json::to_value(&params).unwrap();
+        assert_eq!(text["cwd"], "/tmp/project");
+        assert_eq!(text["approvalRequests"], true);
+        assert_eq!(text["capabilities"]["userQuestions"], true);
+        assert!(
+            text.get("reasoningEffort").is_none(),
+            "optional fields are omitted"
+        );
+    }
+}

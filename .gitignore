@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+**/target/
+*.rlib
+*.rmeta
+
+# Local scratch space (probes, throwaway fixtures)
+/.tmp/
+/tmp/
+*.log
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local runtime/log configuration
+/.dsh-tui/
