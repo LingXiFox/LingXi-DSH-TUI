@@ -7,7 +7,7 @@ default-members = ["crates/dsh-tui"]
 # Single source of truth lives in runtime/upstream.lock.toml. This value is kept
 # in sync by `cargo run -p dsh-protocol --bin dsh-runtime-lock -- set` and is
 # enforced by `dsh-runtime-lock verify` on every CI run.
-version = "0.2.2-rc.5"
+version = "0.2.1-rc.5"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

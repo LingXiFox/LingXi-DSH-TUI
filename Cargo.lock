@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-protocol"
-version = "0.2.2-rc.5"
+version = "0.2.1-rc.5"
 dependencies = [
  "semver",
  "serde",
@@ -194,14 +194,14 @@ dependencies = [
 
 [[package]]
 name = "dsh-state"
-version = "0.2.2-rc.5"
+version = "0.2.1-rc.5"
 dependencies = [
  "dsh-protocol",
 ]
 
 [[package]]
 name = "dsh-tui"
-version = "0.2.2-rc.5"
+version = "0.2.1-rc.5"
 dependencies = [
  "crossterm",
  "dsh-protocol",
