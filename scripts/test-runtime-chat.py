@@ -223,7 +223,7 @@ def exercise(binary, root, work, server):
         # Let the terminal distinguish a standalone Escape from an escape sequence.
         expect("·  prompt")
         os.write(terminal, b"\x10")
-        expect("Commands")
+        expect("Command palette")
         os.write(terminal, b"/route deepseek-official deepseek-v4-pro\r")
         expect("Session resumed")
         assert runtime not in process_table(), "SDK runtime survived route restart"
@@ -249,7 +249,7 @@ def exercise(binary, root, work, server):
         expect("allowed.txt.")
         assert not allowed.exists(), "Tool ran before approval"
         os.write(terminal, b"\t")
-        expect("> Allow once")
+        expect("› Allow once")
         os.write(terminal, b"\r")
         expect("Confirmed response 7")
         assert allowed.read_text() == "approval-marker", "Approved tool did not run"
@@ -272,11 +272,11 @@ def exercise(binary, root, work, server):
         child_id = child_row.search(screen_text(output)).group(1)
         expect("Turn finished")
         os.write(terminal, b"\x10")
-        expect("Commands")
+        expect("Command palette")
         os.write(terminal, f"/view {child_id}\r".encode())
         expect(CHILD_REPLY)
         os.write(terminal, b"\x10")
-        expect("Commands")
+        expect("Command palette")
         os.write(terminal, b"/quit\r")
         expect("TTY_RESTORED", raw=True)
         _, status = os.waitpid(wrapper, 0)

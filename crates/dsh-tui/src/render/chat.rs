@@ -336,11 +336,15 @@ impl Viewport {
     ) -> Option<Piece> {
         Some(match &session.rows[pos.row] {
             Row::Text { label, .. } if pos.part == 0 => Piece::new(
-                label.to_string(),
                 match *label {
-                    "You" => Color::Cyan,
+                    "You" => "▏ You".into(),
+                    "Assistant" => "▏ Assistant".into(),
+                    _ => label.to_string(),
+                },
+                match *label {
+                    "You" => super::screen::ACCENT,
                     "Error" => Color::LightRed,
-                    "Assistant" => Color::LightGreen,
+                    "Assistant" => Color::Reset,
                     _ => Color::DarkGray,
                 },
             ),
@@ -371,7 +375,7 @@ impl Viewport {
                         group.failed
                     ),
                     if group.failed == 0 {
-                        Color::Yellow
+                        Color::Gray
                     } else {
                         Color::LightRed
                     },
@@ -421,7 +425,7 @@ impl Viewport {
                             if tool.failed {
                                 Color::LightRed
                             } else {
-                                Color::Yellow
+                                Color::Gray
                             },
                         )
                     }
@@ -695,7 +699,7 @@ pub(super) fn safe_text(text: &str) -> String {
         .collect()
 }
 
-fn wrap(
+pub(super) fn wrap(
     text: &str,
     width: usize,
     markdown: bool,

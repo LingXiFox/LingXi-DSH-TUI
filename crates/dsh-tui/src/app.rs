@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use self::interaction::Interaction;
 use crate::render::{
-    chat::Viewport,
+    chat::{Mode, Viewport},
     screen::{self, Modal, Screen},
 };
 use crate::runtime::{Inbound, RpcResult, RuntimeConfig, RuntimeHandle};
@@ -40,9 +40,10 @@ enum Operation {
 
 enum Overlay {
     Help,
-    Commands(Draft),
+    Commands(Picker),
     History { picker: Picker },
     Inventory(Picker),
+    Settings(Picker),
 }
 
 #[derive(Clone)]
@@ -51,6 +52,8 @@ enum PickAction {
     Official(String),
     Route(String, String),
     Skill(String),
+    Command(&'static str),
+    Mode(Mode),
     None,
 }
 
@@ -80,38 +83,47 @@ impl Picker {
     }
 
     fn modal(&self) -> Modal<'_> {
-        let body = if self.rows.is_none() {
-            "Reading session index…".into()
-        } else {
-            let start = self.selected.saturating_sub(3);
-            let rows = self
-                .matches()
-                .enumerate()
-                .skip(start)
-                .take(5)
-                .map(|(index, (label, _))| {
-                    format!("{} {label}", if index == self.selected { "›" } else { " " })
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if rows.is_empty() {
-                "No matching entries".into()
-            } else {
-                rows
-            }
-        };
-        Modal {
-            title: self.title,
-            body: format!("Type to filter · ↑/↓ select · Enter opens · Esc closes\n{body}"),
-            input: Some(&self.query),
+        let start = self.selected.saturating_sub(20);
+        let mut rows: Vec<_> = self
+            .matches()
+            .skip(start)
+            .take(41)
+            .map(|(label, _)| label.clone())
+            .collect();
+        if rows.is_empty() {
+            rows.push(
+                if self.rows.is_none() {
+                    "Reading session index…"
+                } else {
+                    "No matching entries"
+                }
+                .into(),
+            );
         }
+        let mut modal = Modal::text(self.title, "");
+        modal.list = Some((
+            rows,
+            if self.matches().next().is_some() {
+                self.selected - start
+            } else {
+                usize::MAX
+            },
+        ));
+        modal.input = Some((&self.query, "Filter…"));
+        modal.hint = " ↑/↓ select · Enter open · Esc close ";
+        modal
     }
 
     fn key(&mut self, key: KeyEvent) -> Option<PickAction> {
         match key.code {
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => {
-                self.selected = (self.selected + 1).min(self.matches().count().saturating_sub(1))
+            KeyCode::Up | KeyCode::PageUp => {
+                self.selected =
+                    self.selected
+                        .saturating_sub(if key.code == KeyCode::Up { 1 } else { 5 })
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                self.selected = (self.selected + if key.code == KeyCode::Down { 1 } else { 5 })
+                    .min(self.matches().count().saturating_sub(1))
             }
             KeyCode::Enter => {
                 return self
@@ -120,15 +132,36 @@ impl Picker {
                     .map(|(_, action)| action.clone());
             }
             _ => {
-                if self.query.text().len() < 256 || !matches!(key.code, KeyCode::Char(_)) {
-                    edit_key(&mut self.query, key, false);
+                if !matches!(key.code, KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL))
+                    && edit_key(&mut self.query, key, false)
+                {
+                    self.selected = 0;
                 }
-                self.selected = 0;
             }
         }
         None
     }
 }
+
+const COMMANDS: &[(&str, &str, bool)] = &[
+    ("/history", "Search sessions", false),
+    ("/models", "Switch provider or model", false),
+    ("/plugins", "Inspect official plugins", false),
+    ("/skills", "Browse official skills", false),
+    ("/mcp", "Inspect MCP status", false),
+    ("/settings", "Set tool detail", true),
+    ("/new", "Start a session", false),
+    ("/resume ID", "Resume a session", false),
+    ("/cwd", "Show session directory", false),
+    ("/route PROVIDER MODEL", "Set the SDK route", false),
+    ("/reload", "Restart the SDK", false),
+    ("/view ID", "View a child session", false),
+    ("/back", "Return to the parent", false),
+    ("/failure", "Jump to a failed tool", true),
+    ("/draft", "Recover the last prompt", false),
+    ("/help", "Keyboard shortcuts", true),
+    ("/quit", "Close the client", true),
+];
 
 type HistoryResult = io::Result<Vec<(String, PickAction)>>;
 type StageResult = (String, io::Result<PathBuf>);
@@ -215,6 +248,7 @@ struct App {
     staging: Option<tokio::task::JoinHandle<StageResult>>,
     interactions: Vec<Interaction>,
     overlay: Option<Overlay>,
+    modal_scroll: u16,
     status: String,
     cwd: String,
     route: String,
@@ -249,6 +283,7 @@ impl App {
             staging: None,
             interactions: Vec::new(),
             overlay: None,
+            modal_scroll: 0,
             status: String::new(),
             cwd: String::new(),
             route: String::new(),
@@ -301,24 +336,14 @@ impl App {
     fn draw(&mut self, terminal: &mut TerminalSession) -> io::Result<()> {
         let running = self.busy();
         let id = self.viewed.as_deref().unwrap_or(&self.session);
-        let modal = self.interactions.first().map(Interaction::modal).or_else(|| match &self.overlay {
-            Some(Overlay::Help) => Some(Modal {
-                title: " Keyboard ",
-                body: "Enter sends · Ctrl+J inserts a newline\nShift+arrows select · Ctrl+A selects all\nPgUp/PgDn scroll · F6 switches focus\nTab folds · Ctrl+L changes mode · Ctrl+P opens commands\nEsc returns · Ctrl+C interrupts or quits".into(),
-                input: None,
-            }),
-            Some(Overlay::Commands(input)) => Some(Modal {
-                title: " Commands ",
-                body: if self.offline {
-                    "/failure   /help   /quit\nOffline: Agent and tools are disabled."
-                } else {
-                    "/models   /history   /plugins   /skills   /mcp\n/new   /resume ID   /cwd   /route PROVIDER MODEL\n/reload   /view ID   /back   /failure   /draft   /help   /quit"
-                }.into(),
-                input: Some(input),
-            }),
-            Some(Overlay::History { picker } | Overlay::Inventory(picker)) => Some(picker.modal()),
+        let mut modal = self.interactions.first().map(Interaction::modal).or_else(|| match &self.overlay {
+            Some(Overlay::Help) => Some(Modal::text(" Keyboard ", "Enter sends · Ctrl+J inserts a newline\nShift+arrows select · Ctrl+A selects all\nPgUp/PgDn scroll · F6 switches focus\nTab folds · Ctrl+L changes mode · Ctrl+P opens commands\nEsc returns · Ctrl+C interrupts or quits")),
+            Some(Overlay::Commands(picker) | Overlay::History { picker } | Overlay::Inventory(picker) | Overlay::Settings(picker)) => Some(picker.modal()),
             None => None,
         });
+        if let Some(modal) = &mut modal {
+            modal.scroll = self.modal_scroll;
+        }
         let screen = Screen {
             cwd: &self.cwd,
             session: id,
@@ -661,6 +686,11 @@ impl App {
         if matches!(action, PickAction::None) {
             return;
         }
+        if let PickAction::Mode(mode) = action {
+            self.viewport.mode = mode;
+            self.overlay = None;
+            return;
+        }
         if self.busy() || self.operation.is_some() || self.staging.is_some() {
             self.status = "Finish the active request first".into();
             return;
@@ -695,15 +725,29 @@ impl App {
                 self.viewport.focused = false;
                 self.draft.replace(format!("/{name} "));
             }
-            PickAction::None => (),
+            PickAction::None | PickAction::Command(_) | PickAction::Mode(_) => (),
         }
     }
 
     async fn command(&mut self, input: &str) {
+        self.modal_scroll = 0;
         let words: Vec<_> = input.split_whitespace().collect();
         match words.as_slice() {
             ["/quit"] => self.quit = true,
             ["/help"] => self.overlay = Some(Overlay::Help),
+            ["/settings"] => {
+                let mut picker = Picker::new(
+                    " Settings · Tool detail ",
+                    Some(
+                        [Mode::Compact, Mode::Normal, Mode::Verbose]
+                            .into_iter()
+                            .map(|mode| (mode.label().into(), PickAction::Mode(mode)))
+                            .collect(),
+                    ),
+                );
+                picker.selected = self.viewport.mode as usize;
+                self.overlay = Some(Overlay::Settings(picker));
+            }
             ["/failure"] => {
                 let id = self.id().to_owned();
                 if !self.viewport.failure(&id, &self.conversation) {
@@ -724,7 +768,7 @@ impl App {
                 self.viewed = None;
                 self.viewport.reset();
             }
-            ["/new" | "/history" | "/resume" | "/route" | "/reload", ..]
+            ["/new" | "/resume" | "/route" | "/reload", ..]
                 if self.busy() || self.operation.is_some() || self.staging.is_some() =>
             {
                 self.status = "Finish or interrupt the active request first".into();
@@ -775,12 +819,23 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if (!self.interactions.is_empty() || matches!(self.overlay, Some(Overlay::Help)))
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+        {
+            self.modal_scroll = if key.code == KeyCode::PageUp {
+                self.modal_scroll.saturating_sub(3)
+            } else {
+                self.modal_scroll.saturating_add(3)
+            };
+            return;
+        }
         if let Some(interaction) = self.interactions.first_mut() {
             if let Some(result) = interaction.key(key) {
                 if let Some(runtime) = &self.runtime {
                     match runtime.answer(interaction.id().clone(), result) {
                         Ok(()) => {
                             self.interactions.remove(0);
+                            self.modal_scroll = 0;
                         }
                         Err(error) => self.status = error,
                     }
@@ -791,17 +846,33 @@ impl App {
         if let Some(overlay) = &mut self.overlay {
             if key.code == KeyCode::Esc || ctrl && key.code == KeyCode::Char('c') {
                 self.overlay = None;
-            } else if let Overlay::History { picker } | Overlay::Inventory(picker) = overlay {
+            } else if let Overlay::History { picker }
+            | Overlay::Inventory(picker)
+            | Overlay::Settings(picker) = overlay
+            {
                 if let Some(action) = picker.key(key) {
                     self.pick(action).await;
                 }
-            } else if let Overlay::Commands(draft) = overlay {
-                if key.code == KeyCode::Enter {
-                    let command = draft.text().to_owned();
+            } else if let Overlay::Commands(picker) = overlay {
+                let input = picker.query.text().trim();
+                let raw = input.starts_with('/')
+                    && (input.contains(char::is_whitespace)
+                        || COMMANDS.iter().any(|(cmd, _, _)| *cmd == input));
+                if key.code == KeyCode::Enter && raw {
+                    let command = input.to_owned();
                     self.overlay = None;
                     self.command(&command).await;
-                } else {
-                    edit_key(draft, key, false);
+                } else if let Some(PickAction::Command(command)) = picker.key(key) {
+                    if command.contains(' ') {
+                        picker.query.replace(format!(
+                            "{} ",
+                            command.split_whitespace().next().unwrap_or_default()
+                        ));
+                        picker.selected = 0;
+                    } else {
+                        self.overlay = None;
+                        self.command(command).await;
+                    }
                 }
             }
             return;
@@ -815,7 +886,18 @@ impl App {
                 self.quit = true;
             }
         } else if ctrl && key.code == KeyCode::Char('p') {
-            self.overlay = Some(Overlay::Commands(Draft::default()));
+            self.overlay = Some(Overlay::Commands(Picker::new(
+                " Command palette ",
+                Some(
+                    COMMANDS
+                        .iter()
+                        .filter(|(_, _, offline)| !self.offline || *offline)
+                        .map(|&(cmd, label, _)| {
+                            (format!("{cmd:<22} {label}"), PickAction::Command(cmd))
+                        })
+                        .collect(),
+                ),
+            )));
         } else if ctrl && key.code == KeyCode::Char('l') {
             self.viewport.mode = self.viewport.mode.next();
         } else if key.code == KeyCode::F(6) {
@@ -829,6 +911,7 @@ impl App {
             && (self.viewport.focused || self.draft.text().is_empty())
         {
             self.overlay = Some(Overlay::Help);
+            self.modal_scroll = 0;
         } else if key.code == KeyCode::Tab {
             let id = self.id().to_owned();
             self.viewport.toggle(&id, &self.conversation);
@@ -857,8 +940,15 @@ impl App {
     fn paste(&mut self, text: &str) {
         if let Some(interaction) = self.interactions.first_mut() {
             interaction.paste(text);
-        } else if let Some(Overlay::Commands(draft)) = &mut self.overlay {
-            insert(draft, text);
+        } else if let Some(
+            Overlay::Commands(picker)
+            | Overlay::History { picker }
+            | Overlay::Inventory(picker)
+            | Overlay::Settings(picker),
+        ) = &mut self.overlay
+        {
+            insert(&mut picker.query, &text.replace(['\r', '\n', '\t'], " "));
+            picker.selected = 0;
         } else if self.overlay.is_none() && !self.viewport.focused {
             insert(&mut self.draft, text);
         }

@@ -75,7 +75,7 @@ cargo run -p dsh-tui
 | Enter | 发送当前草稿 |
 | Ctrl+J / Shift+Enter | 换行。若终端无法区分 Shift+Enter，可使用 Ctrl+J 或设置 `DSH_TUI_NEWLINE=alt-enter` 后使用 Alt+Enter |
 | Shift+方向键 / Ctrl+A | 选择文本 |
-| Ctrl+P | 打开命令面板，输入命令后按 Enter |
+| Ctrl+P | 打开命令面板，输入关键字过滤，方向键选择后按 Enter；也可直接输入完整 `/命令` |
 | Ctrl+L | 切换 Compact、Normal、Verbose |
 | Tab | 展开或折叠工具组、单个调用或子会话摘要 |
 | F6 / Esc | 切换输入与历史焦点，或关闭浮层、从子会话返回 |
@@ -84,6 +84,8 @@ cargo run -p dsh-tui
 | ? | 查看帮助 |
 
 Compact 按轮次显示工具数量与状态。Normal 按执行步骤展示调用及输出摘要。Verbose 提供参数、输出和错误的完整文本。
+
+P6 界面参考 [OpenCode 2.3.2](https://github.com/anomalyco/opencode/tree/v2.3.2/packages/tui/src) 的会话页、输入区与选择弹窗：单列正文最大 104 格，底部是带边框的可换行草稿和模型信息栏。推理档位取自 SDK 的模型选择或请求头；没有记录时使用模型默认值，离线回放则显示 `—`。缓存数字是上一条回复实际报告的读写 token 数，`—` 表示未上报。历史、模型、插件、技能、MCP、`/settings` 和权限提示共用有暗色遮罩的自适应弹窗。弹窗内 `Esc` 返回，权限详情较长时用 `PgUp` / `PgDn` 阅读。权限仍默认拒绝。界面只响应输入、尺寸变化及 SDK 事件，不轮询重绘。
 
 在命令面板中，`/new` 开始新会话，`/history` 打开可搜索的会话选择器，`/resume ID` 恢复已知会话，`/cwd` 查询会话目录。空闲时可用 `/route PROVIDER MODEL` 重连到指定模型路由。`/failure` 跳到失败工具，`/view ID` 查看已经收到事件的子会话，`/draft` 取回发送失败的草稿，`/quit` 退出。
 

@@ -92,26 +92,20 @@ impl Interaction {
 
     pub(super) fn modal(&self) -> Modal<'_> {
         match &self.kind {
-            Kind::Approval { summary, allow } => Modal {
-                title: " Tool approval ",
-                body: format!(
-                    "{summary}\n\n{}",
-                    if *allow {
-                        "  Deny     > Allow once"
-                    } else {
-                        "> Deny       Allow once"
-                    }
-                ),
-                input: None,
-            },
+            Kind::Approval { summary, allow } => {
+                let mut modal = Modal::text(" Tool approval ", summary.as_str());
+                modal.warning = true;
+                modal.hint = " ←/→ choose · PgUp/PgDn details · Enter confirm · Esc cancel ";
+                modal.list = Some((
+                    vec!["Deny".into(), "Allow once".into()],
+                    usize::from(*allow),
+                ));
+                modal
+            }
             Kind::Questions { items, index, .. } if *index < items.len() => {
                 items[*index].modal(*index, items.len())
             }
-            Kind::Questions { .. } => Modal {
-                title: " Agent question ",
-                body: "Answers ready".into(),
-                input: None,
-            },
+            Kind::Questions { .. } => Modal::text(" Agent question ", "Answers ready"),
         }
     }
 
@@ -124,8 +118,8 @@ impl Interaction {
                     return Some(json!({"outcome":"cancelled"}));
                 }
                 match key.code {
-                    KeyCode::Left => *allow = false,
-                    KeyCode::Right => *allow = true,
+                    KeyCode::Left | KeyCode::Up => *allow = false,
+                    KeyCode::Right | KeyCode::Down => *allow = true,
                     KeyCode::Tab => *allow = !*allow,
                     KeyCode::Enter => {
                         return Some(
@@ -205,23 +199,25 @@ impl Question {
     }
 
     fn modal(&self, index: usize, count: usize) -> Modal<'_> {
-        let mut body = format!("{}/{}  {}\n", index + 1, count, self.text);
-        let start = self.focus.saturating_sub(4);
-        for (i, (label, description)) in self.options.iter().enumerate().skip(start).take(5) {
-            let marker = if self.focus == i { ">" } else { " " };
+        let start = self.focus.saturating_sub(20);
+        let end = (start + 41).min(self.options.len());
+        let mut rows = Vec::new();
+        for (i, (label, description)) in self.options.iter().enumerate().take(end).skip(start) {
             let state = if self.selected[i] { "x" } else { " " };
-            body.push_str(&format!("{marker} [{state}] {label}  {description}\n"));
+            rows.push(format!("[{state}] {label}  {description}"));
         }
-        body.push_str(if self.focus == self.options.len() {
-            "> Custom answer"
-        } else {
-            "  Custom answer"
-        });
-        Modal {
-            title: " Agent question ",
-            body,
-            input: (self.focus == self.options.len()).then_some(&self.custom),
+        if end == self.options.len() {
+            rows.push("Custom answer".into());
         }
+        let mut modal = Modal::text(
+            " Agent question ",
+            format!("{}/{}  {}", index + 1, count, self.text),
+        );
+        modal.list = Some((rows, self.focus - start));
+        modal.input =
+            (self.focus == self.options.len()).then_some((&self.custom, "Type an answer…"));
+        modal.hint = " ↑/↓ select · Space mark · Enter answer · Esc cancel ";
+        modal
     }
 
     fn key(&mut self, key: KeyEvent) -> Option<Value> {

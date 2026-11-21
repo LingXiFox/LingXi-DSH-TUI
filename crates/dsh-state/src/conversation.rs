@@ -65,6 +65,36 @@ pub struct Turn {
     lookup: HashMap<String, usize>,
 }
 
+/// Model metadata recorded in a model selection or resolved request header.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ModelRoute {
+    /// Provider ID.
+    pub provider: String,
+    /// Model ID within that provider.
+    pub model: String,
+    /// SDK-reported effort when available.
+    pub reasoning_effort: Option<String>,
+}
+
+impl ModelRoute {
+    fn from_event(data: &Value) -> Option<Self> {
+        Some(Self {
+            provider: data["provider"].as_str()?.into(),
+            model: data["model"].as_str()?.into(),
+            reasoning_effort: data["reasoningEffort"].as_str().map(str::to_owned),
+        })
+    }
+}
+
+/// Optional cache counters from one assistant response. Absence differs from zero.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CacheUsage {
+    /// Cached input tokens read.
+    pub read: Option<u64>,
+    /// Input tokens written to the cache.
+    pub write: Option<u64>,
+}
+
 /// An SDK session projected independently of every other session.
 #[derive(Debug, Default)]
 pub struct Session {
@@ -76,8 +106,10 @@ pub struct Session {
     pub running: bool,
     /// Parent session if this is a local child.
     pub parent: Option<String>,
-    /// Latest token accounting, as reported by the adapter.
-    pub usage: Option<Value>,
+    /// Latest recorded model route.
+    pub route: Option<ModelRoute>,
+    /// Cache counters, if reported for the latest assistant response.
+    pub cache: Option<CacheUsage>,
     /// Latest child completion or turn outcome.
     pub outcome: Option<String>,
     /// Latest assembled assistant text for child-session previews.
@@ -414,7 +446,8 @@ impl Session {
         self.turns.clear();
         self.group_rows.clear();
         self.failures.clear();
-        self.usage = None;
+        self.route = None;
+        self.cache = None;
         self.summary = None;
         self.unhandled = 0;
         self.generation += 1;
@@ -450,9 +483,11 @@ impl Session {
                 }
                 let reasoning = stream_text(&data["stream"], "reasoning-chunks");
                 self.text("Reasoning", reasoning, archive)?;
-                if !data["usage"].is_null() {
-                    self.usage = Some(data["usage"].clone());
-                }
+                let usage = &data["usage"];
+                let read = usage["cacheReadTokens"].as_u64();
+                let write = usage["cacheWriteTokens"].as_u64();
+                self.cache =
+                    (read.is_some() || write.is_some()).then_some(CacheUsage { read, write });
                 if data["interrupted"] == true {
                     self.text("Notice", "Assistant output interrupted".into(), archive)?;
                 }
@@ -467,9 +502,18 @@ impl Session {
             }
             "tool/call" => self.tool(data, false, archive)?,
             "tool/result" => self.tool(data, true, archive)?,
-            "turn/start" | "step/start" | "step/end" | "request/header" | "request/context"
-            | "system/message" | "developer/message" | "session/end-seed" | "assistant/attempt" => {
+            "model/selection" => {
+                if let Some(route) = ModelRoute::from_event(data) {
+                    self.route = Some(route);
+                }
             }
+            "request/header" => {
+                if let Some(route) = ModelRoute::from_event(&data["header"]["config"]) {
+                    self.route = Some(route);
+                }
+            }
+            "turn/start" | "step/start" | "step/end" | "request/context" | "system/message"
+            | "developer/message" | "session/end-seed" | "assistant/attempt" => {}
             kind => {
                 self.unhandled += 1;
                 if kind.starts_with("command/")
@@ -696,6 +740,48 @@ mod tests {
             ServerNotification::SessionEvent,
             json!({"sessionId":"root", "event":{"type":kind,"seq":seq,"time":1,"data":data}}),
         )
+    }
+
+    #[test]
+    fn latest_route_and_cache_distinguish_resolved_effort_zero_and_missing() {
+        let mut chat = Conversation::default();
+        for item in [
+            event(1, "model/selection", json!({"provider":"a","model":"b"})),
+            event(
+                3,
+                "assistant/message",
+                json!({"usage":{"cacheReadTokens":0}}),
+            ),
+        ] {
+            chat.push(item).unwrap();
+        }
+        chat.flush().unwrap();
+        chat.push(event(
+            2,
+            "request/header",
+            json!({"header":{"config":{"provider":"a","model":"b","reasoningEffort":"high"}}}),
+        ))
+        .unwrap();
+        let session = &chat.sessions["root"];
+        assert_eq!(
+            session.route.as_ref().unwrap().reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            session.cache,
+            Some(CacheUsage {
+                read: Some(0),
+                write: None
+            })
+        );
+
+        chat.push(event(
+            4,
+            "assistant/message",
+            json!({"usage":{"outputTokens":17}}),
+        ))
+        .unwrap();
+        assert_eq!(chat.sessions["root"].cache, None);
     }
 
     #[test]
