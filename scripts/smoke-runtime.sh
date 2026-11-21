@@ -41,9 +41,7 @@ VERSION=$(read_lock runtime version)
 reported=$(node "$SUBMODULE/$ENTRY" --version 2>&1 | tail -1)
 [[ -n "$reported" ]] || fail "$ENTRY --version produced no output"
 
-case "$reported" in
-    *"$VERSION"*) ;;
-    *) fail "runtime reports '$reported' but the lock pins $VERSION" ;;
-esac
+[[ "$reported" = "$VERSION" ]] \
+    || fail "runtime reports '$reported' but the lock pins $VERSION"
 
 printf 'smoke-runtime: ok %s reports %s\n' "$ENTRY" "$VERSION"

@@ -1,6 +1,6 @@
 # LingXi DSH-TUI
 
-一个用 Rust + Ratatui 写的 DeepSeek Harness 原生终端客户端。图形界面不是目标，**原生、轻、快**才是。没有 Electron，没有 Chromium，没有 WebView，没有 JS 运行时——只有终端和一个 Rust 二进制。
+一个用 Rust + Ratatui 写的 DeepSeek Harness 原生终端客户端。Rust 进程负责终端界面，官方 Agent 在独立 Node.js 进程中运行。
 
 Agent 本身不做任何重写。Agent Loop、Provider 适配、工具调用、MCP、SubAgent、上下文管理、会话持久化全部来自官方 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)。官方运行时以**子模块 + 固定提交**的形式随本仓库一起构建、一起分发，用户不需要另外安装 DSH，客户端也不会在启动时联网拉取或升级运行时。
 
@@ -11,30 +11,21 @@ Agent 本身不做任何重写。Agent Loop、Provider 适配、工具调用、M
 | | LingXi DSH-TUI | 官方 Desktop | 官方 CLI |
 | --- | --- | --- | --- |
 | 形态 | 原生 TUI | Electron | 终端 |
-| 内存 | 单二进制，无独立渲染进程 | Chromium + Node | Node |
+| 进程 | Rust TUI + Node Agent | Chromium + Node | Node |
 | 适用 | 长期挂着的会话、远程/SSH、低配机 | 图形交互 | 脚本化 |
 | Agent | 官方运行时（随包分发） | 官方运行时 | 官方运行时 |
 
-目标不是替代官方客户端，而是补上「终端里长期驻留、轻量、可远程」这一类场景。
+适用于终端里长期驻留的会话与远程访问。
 
 ## 架构
 
 ```text
-┌──────────────────────┐        JSON-RPC 2.0 (stdio, newline-delimited)
-│  dsh-tui (Rust)      │  <───────────────────────────────────────────────┐
-│  ratatui + crossterm │                                                  │
-└─────────┬────────────┘                                                  │
-          │  frames                                                    │
-          ▼                                                            │
-┌──────────────────────┐     ┌──────────────────────────────────────────┴───┐
-│  dsh-state           │     │  bundled DSH runtime (official, separate      │
-│  event projection    │     │  process): Agent Loop / Provider / Tools /    │
-│  folding / view      │     │  MCP / SubAgent / Sessions                    │
-└─────────┬────────────┘     └───────────────────────────────────────────────┘
+Official DSH runtime (separate Node.js process)
+          │ JSON-RPC 2.0 on stdio, newline-delimited
           ▼
-┌──────────────────────┐
-│  dsh-protocol        │  wire types, runtime lock, version comparison
-└──────────────────────┘
+dsh-protocol  →  dsh-state  →  dsh-tui
+wire types      projection    Ratatui rendering and keyboard input
+runtime lock    folding       terminal lifecycle
 ```
 
 三个 crate，职责单向流动，互不越界：
@@ -55,7 +46,7 @@ Agent 本身不做任何重写。Agent Loop、Provider 适配、工具调用、M
 
 ## 本地开发
 
-前置：Rust stable（edition 2024，`rust-version = 1.85`）、Node.js ≥ 24.9.0、corepack（`pnpm@11.28.5`）。
+构建需要 Rust stable（edition 2024，`rust-version = 1.85`）。构建官方运行时另需 Node.js ≥ 24.9.0 和可用的 `pnpm@11.28.5`，构建脚本使用已配置的包管理器。
 
 ```sh
 git clone --recurse-submodules https://github.com/LingXiFox/LingXi-DSH-TUI.git
@@ -78,6 +69,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ./scripts/check-runtime-pin.sh
 ./scripts/test-pin-guards.sh
+./scripts/test-sync-merge.sh
 ```
 
 ## 版本管理
@@ -106,13 +98,15 @@ cargo run -p dsh-protocol --bin dsh-runtime-lock -- check        # lock + 子模
 
 1. **detect** — 拉取全部 releases，交给 `dsh-runtime-lock select` 判断是否有更新的版本（含稳定版 / RC 排序，杜绝降级）。无更新则直接结束，不建 PR。
 2. **prepare** — 建专用升级分支，把子模块移到该 tag 的提交，同步 lock 文件与工作区版本，校验补丁、协议契约，生成协议差异摘要。
-3. **verify-rust** — 在该分支上跑 `fmt` / `clippy` / `test`。
+3. **verify-rust** — 对准备阶段产出的完整 commit 跑 `fmt` / `clippy` / `test` / `build` 与守卫回归测试。
 4. **verify-runtime** — 用锁定的 Node / pnpm 版本真实构建一次运行时，并 smoke-test `--version`。
-5. **open-pr** — 标题 `chore(runtime): sync DSH vX.Y.Z`，正文含当前/目标版本、完整 commit、release 链接、补丁与应用结果、协议契约结果、构建测试状态与人工复核清单。同一版本已有开放 PR 时不重复创建。
-6. **auto-merge** — 默认**关闭**，需仓库变量 `AUTO_MERGE_UPSTREAM=true`。即便打开，也只在无冲突、所有检查通过、协议契约通过时合并；合并源码 ≠ 发布。
-7. **report-failure** — 冲突、补丁失效、运行时构建失败、Rust 编译失败、协议契约被破坏、测试失败时，只维护**一个** issue，附错误摘要与 workflow 链接；旧版本继续生效。
+5. **open-pr** — 标题 `chore(runtime): sync DSH vX.Y.Z`，正文含当前/目标版本、完整 commit、上游发布说明、协议差异与验证结果。同一版本重用已有 PR，重跑也保留升级分支的历史及维护者修复。手动 `dry_run=true` 会准备并推送验证分支。
+6. **auto-merge** — 默认关闭，由仓库变量 `AUTO_MERGE_UPSTREAM=true` 开启。合并前等待全部检查，核对三平台 CI 与运行时检查齐全通过、当前 head 等于已验证 commit、分支可合并，以及人工阻止标签和 review 状态。`runtime-sync/blocked` 由机器人维护，人工可用 `no-auto-merge`、`do-not-merge`、`breaking-change`、`major-risk`、`hold` 或 `blocked` 阻止合并。
+7. **report-failure** — 每个目标版本维护一个 issue，重跑更新正文，附失败任务、错误日志片段及 workflow 链接。
 
-PR 由 `GITHUB_TOKEN` 打开时不会触发 `pull_request` 类 workflow——这是 GitHub 的限制。仓库可选配置 `SYNC_APP_ID` / `SYNC_APP_PRIVATE_KEY` Secrets 改用 GitHub App token；未配置时 workflow 会显式告警，依赖本 workflow 内部的检查作为门禁。所有凭据只走 GitHub Secrets，不落日志。
+PR 打开或刷新后，流水线显式触发 `CI` 与 `Runtime check`。开启自动合并时，流水线等待本次触发的运行完成，并核对两次运行验证的提交。创建 PR 需要配置具有 Pull requests 写权限的 GitHub App（`SYNC_APP_ID` / `SYNC_APP_PRIVATE_KEY`），或在仓库设置允许 GitHub Actions 使用 `GITHUB_TOKEN` 创建 PR。
+
+`runtime/protocol-source.lock` 记录已审阅 SDK 协议源码的 Git blob 哈希。文件、字段、方法或传输实现变化都会使 `contract` 失败，维护者审阅 Rust 类型及测试后更新快照。导入的领域类型与真实 Agent 进程兼容性验证安排在第二轮。
 
 ### 发布
 
@@ -129,6 +123,7 @@ PR 由 `GITHUB_TOKEN` 打开时不会触发 `pull_request` 类 workflow——这
 - [x] 官方 SDK 线路契约镜像（8 个 client 方法、6 个 server 通知、`approval/request`），带契约测试
 - [x] 上游同步流水线（检测、升级分支、门禁、PR、失败 issue、受控 auto-merge）
 - [x] CI（fmt / clippy / test / build / 运行时锁定 / shellcheck / 守卫反向测试）
+- [x] macOS / Linux / Windows 的 Rust CI 矩阵已运行。
 - [x] 打包脚本骨架（`build-runtime.sh`、`package.sh`、`smoke-runtime.sh`）
 - [x] 版本单源 + 版本漂移守卫（含反向用例）
 
@@ -139,7 +134,6 @@ PR 由 `GITHUB_TOKEN` 打开时不会触发 `pull_request` 类 workflow——这
 - [ ] **没有 Provider 配置**、模型选择、密钥管理界面。
 - [ ] **没有会话持久化界面的接入**（恢复 / 列举历史会话）。
 - [ ] **没有 release 实际产物**。`release.yml` 是结构与流程，尚未产出过发布。
-- [ ] **Windows 未验证**。CI 矩阵预留了 Windows，但未在任何 Windows 机器上实跑。
 - [ ] **auto-merge 未在真实仓库验证**。逻辑已实现，需要打开仓库变量并触发一次真实同步才能证实。
 - [ ] 性能基准（长会话 / 高频事件）未建立基线。
 

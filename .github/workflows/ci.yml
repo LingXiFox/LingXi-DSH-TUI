@@ -68,7 +68,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --locked
       - name: Version banner matches the lock file
-        run: ./target/debug/dsh-tui --version | tee /tmp/version.txt && grep -q "0.2.2-rc.5" /tmp/version.txt
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --locked --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "dsh-tui") | .version')
+          banner=$(./target/debug/dsh-tui --version)
+          echo "$banner"
+          [[ "$banner" == "LingXi DSH TUI $version ("* ]]
 
   pin:
     name: runtime pin
@@ -100,5 +105,8 @@ jobs:
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck scripts/*.sh
       - name: Failure paths report the right reason
-        run: ./scripts/test-pin-guards.sh
-
+        run: git submodule update --init --depth 1 runtime/upstream
+      - name: Guard regression tests
+        run: |
+          ./scripts/test-pin-guards.sh
+          ./scripts/test-sync-merge.sh

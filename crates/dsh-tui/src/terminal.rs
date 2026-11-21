@@ -27,14 +27,14 @@ pub struct TerminalSession {
 impl TerminalSession {
     /// Enter raw mode and the alternate screen.
     pub fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self {
+        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        let mut session = Self {
             terminal,
             restored: false,
-        })
+        };
+        enable_raw_mode()?;
+        execute!(session.terminal.backend_mut(), EnterAlternateScreen, Hide)?;
+        Ok(session)
     }
 
     /// Draw one frame.
@@ -49,11 +49,12 @@ impl TerminalSession {
         if self.restored {
             return Ok(());
         }
-        self.restored = true;
-        disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show)?;
-        self.terminal.show_cursor()?;
-        Ok(())
+        let raw_mode = disable_raw_mode();
+        let screen = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let cursor = execute!(self.terminal.backend_mut(), Show);
+        let result = raw_mode.and(screen).and(cursor);
+        self.restored = result.is_ok();
+        result
     }
 }
 
@@ -76,6 +77,8 @@ mod tests {
             .draw(|f| crate::render::draw(f, &dsh_state::AppState::unversioned("t")))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!((buffer.area.width, buffer.area.height), (80, 24));
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("LingXi DSH-TUI"));
+        assert!(text.contains("detached / idle"));
     }
 }

@@ -6,7 +6,7 @@
 //! ```text
 //! dsh-runtime-lock check      # lock + workspace version + submodule + wire contract
 //! dsh-runtime-lock verify     # lock file and workspace version only
-//! dsh-runtime-lock contract   # upstream SDK protocol names
+//! dsh-runtime-lock contract   # reviewed upstream SDK sources and method names
 //! dsh-runtime-lock show       # print the pinned tag, version and commit
 //! dsh-runtime-lock select --releases <json> [--tag-only]
 //! dsh-runtime-lock set --tag dsh-v0.2.3 --commit <sha>
@@ -24,7 +24,7 @@ use dsh_protocol::sync::{
     workspace_version,
 };
 
-const USAGE: &str = "usage: dsh-runtime-lock <command> [--root <dir>]\n\ncommands:\n  check                 lock, workspace version, submodule commit and wire contract\n  verify                lock file internals and workspace version\n  contract              upstream SDK wire names still present\n  show                  print the pinned tag, version and commit\n  select --releases <json> [--tag-only]\n                        pick the newest non-draft upstream release\n  set --tag <tag> --commit <sha>\n                        move the pin (rewrites the lock and Cargo.toml)\n";
+const USAGE: &str = "usage: dsh-runtime-lock <command> [--root <dir>]\n\ncommands:\n  check                 lock, workspace version, submodule commit and wire contract\n  verify                lock file internals and workspace version\n  contract              reviewed upstream SDK sources and wire names\n  show                  print the pinned tag, version and commit\n  select --releases <json> [--tag-only]\n                        pick the newest non-draft upstream release\n  set --tag <tag> --commit <sha>\n                        move the pin (rewrites the lock and Cargo.toml)\n";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -176,10 +176,30 @@ fn contract(root: &Path) -> Result<String, Failure> {
             source_dir.display()
         )));
     }
-    let mut source = String::new();
-    collect_typescript(&source_dir, &mut source).map_err(|error| {
+    let mut files = Vec::new();
+    collect_typescript(&source_dir, &mut files).map_err(|error| {
         Failure::check(format!("cannot read {}: {error}", source_dir.display()))
     })?;
+    let snapshot = protocol_snapshot(&source_dir, &files)?;
+    let reviewed =
+        std::fs::read_to_string(root.join("runtime/protocol-source.lock")).map_err(|error| {
+            Failure::check(format!("cannot read protocol source snapshot: {error}"))
+        })?;
+    if snapshot != reviewed {
+        return Err(Failure::check(format!(
+            "upstream SDK protocol sources changed; review Rust wire types and tests before updating runtime/protocol-source.lock\nobserved snapshot:\n{snapshot}"
+        )));
+    }
+    // UNCOVERED: imported SessionEvent and other domain types need real SDK tests in round two.
+    let mut source = String::new();
+    for path in &files {
+        source.push_str(
+            &std::fs::read_to_string(path).map_err(|error| {
+                Failure::check(format!("cannot read {}: {error}", path.display()))
+            })?,
+        );
+        source.push('\n');
+    }
     let expected = expected_wire_names();
     let missing = missing_wire_names(&source, &expected);
     if !missing.is_empty() {
@@ -194,7 +214,7 @@ fn contract(root: &Path) -> Result<String, Failure> {
     ))
 }
 
-fn collect_typescript(dir: &Path, out: &mut String) -> std::io::Result<()> {
+fn collect_typescript(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
@@ -203,11 +223,37 @@ fn collect_typescript(dir: &Path, out: &mut String) -> std::io::Result<()> {
         if metadata.is_dir() {
             collect_typescript(&path, out)?;
         } else if path.extension().is_some_and(|extension| extension == "ts") {
-            out.push_str(&std::fs::read_to_string(&path)?);
-            out.push('\n');
+            out.push(path);
         }
     }
     Ok(())
+}
+
+fn protocol_snapshot(dir: &Path, files: &[PathBuf]) -> Result<String, Failure> {
+    let mut snapshot = String::new();
+    for path in files {
+        let output = std::process::Command::new("git")
+            .args(["hash-object", "--no-filters", "--"])
+            .arg(path)
+            .output()
+            .map_err(|error| Failure::check(format!("cannot hash protocol source: {error}")))?;
+        if !output.status.success() {
+            return Err(Failure::check(format!(
+                "cannot hash {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let relative = path
+            .strip_prefix(dir)
+            .map_err(|error| Failure::check(error.to_string()))?;
+        snapshot.push_str(&format!(
+            "{} {}\n",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            relative.to_string_lossy().replace('\\', "/")
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn check(root: &Path) -> Result<String, Failure> {
@@ -369,5 +415,44 @@ mod tests {
     fn unknown_command_is_usage_error() {
         let failure = run(&["frobnicate".to_owned()]).unwrap_err();
         assert_eq!(failure.code, 2);
+    }
+
+    #[test]
+    fn contract_rejects_field_changes_and_added_or_removed_sources() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dsh-protocol-contract-{}-{unique}",
+            std::process::id()
+        ));
+        let source_dir = submodule_dir(&root).join("packages/sdk/protocol/src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let path = source_dir.join("types.ts");
+        let original = format!(
+            "const methods = {};\nexport type Result = {{ value: string }};\n",
+            serde_json::to_string(&expected_wire_names()).unwrap()
+        );
+        std::fs::write(&path, &original).unwrap();
+        let snapshot = protocol_snapshot(&source_dir, std::slice::from_ref(&path)).unwrap();
+        std::fs::write(root.join("runtime/protocol-source.lock"), snapshot).unwrap();
+        assert!(contract(&root).is_ok());
+
+        std::fs::write(&path, original.replace("value: string", "value: number")).unwrap();
+        let failure = contract(&root).unwrap_err();
+        assert!(
+            failure
+                .message
+                .contains("upstream SDK protocol sources changed")
+        );
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(source_dir.join("new.ts"), "export type Added = string;").unwrap();
+        assert!(contract(&root).is_err());
+        std::fs::remove_file(source_dir.join("new.ts")).unwrap();
+        assert!(contract(&root).is_ok());
+        std::fs::remove_file(path).unwrap();
+        assert!(contract(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

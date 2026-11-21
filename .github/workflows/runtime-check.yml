@@ -9,10 +9,21 @@ on:
   schedule:
     - cron: "43 5 * * 1"
   push:
+    branches: [main]
     paths:
+      - "runtime/upstream"
       - "runtime/upstream.lock.toml"
+      - "runtime/protocol-source.lock"
       - ".github/workflows/runtime-check.yml"
       - "scripts/build-runtime.sh"
+      - "scripts/smoke-runtime.sh"
+  pull_request:
+    paths:
+      - "runtime/**"
+      - "crates/dsh-protocol/**"
+      - ".github/workflows/runtime-check.yml"
+      - "scripts/build-runtime.sh"
+      - "scripts/smoke-runtime.sh"
 
 permissions:
   contents: read

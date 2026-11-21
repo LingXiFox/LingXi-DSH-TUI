@@ -105,7 +105,7 @@ jobs:
 
       - name: Build the TUI
         env:
-          DSH_TUI_BUILD_ID: ${{ needs.preflight.outputs.commit }}
+          DSH_TUI_BUILD_ID: ${{ github.sha }}
         run: cargo build --release --locked -p dsh-tui
 
       - name: Assemble the bundle

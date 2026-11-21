@@ -34,8 +34,10 @@ mod tests {
 
     #[test]
     fn version_matches_workspace_version() {
-        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
-        assert_eq!(VERSION, "0.2.2-rc.5");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let lock =
+            dsh_protocol::lock::RuntimeLock::load(root.join("runtime/upstream.lock.toml")).unwrap();
+        assert_eq!(VERSION, lock.product_version());
     }
 
     #[test]

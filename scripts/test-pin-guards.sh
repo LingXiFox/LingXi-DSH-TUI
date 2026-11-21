@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pin-guards.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+trap 'find "$WORK" -depth -delete' EXIT
 
 fail() { printf 'test-pin-guards: %s\n' "$1" >&2; exit 1; }
 
@@ -34,7 +34,7 @@ expect_failure() {
 
 # 1. Workspace version drifts away from the bundled runtime.
 seed "$WORK/drift"
-sed -i.bak 's/^version = "0\.2\.2-rc\.5"$/version = "0.2.2-rc.4"/' "$WORK/drift/Cargo.toml"
+sed -i.bak 's/^version = .*/version = "0.0.0-pin-drift"/' "$WORK/drift/Cargo.toml"
 expect_failure "$WORK/drift" | grep -q 'does not mirror' \
     || fail "version drift was rejected for the wrong reason"
 
