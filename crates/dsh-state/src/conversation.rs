@@ -1,21 +1,18 @@
 //! Ordered SDK event journal and turn-based transcript projection.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use dsh_protocol::protocol::{Notification, Request, ServerNotification};
+use dsh_protocol::protocol::{Frame, Notification, Request, ServerNotification};
 use serde_json::Value;
 
-const REORDER_WINDOW: usize = 32;
+pub use crate::archive::Text;
+use crate::archive::{Archive, Record};
 
-/// One original inbound SDK message, in arrival order.
-#[derive(Debug, Clone)]
-pub enum Received {
-    /// A durable session event or other SDK notification.
-    Notification(Notification),
-    /// An SDK-initiated interaction, including unsupported methods.
-    Request(Request),
-}
+const REORDER_WINDOW: usize = 32;
 
 /// Display rows identified by their index inside a session.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +22,7 @@ pub enum Row {
         /// Speaker or notice kind.
         label: &'static str,
         /// Terminal-independent text or Markdown.
-        body: Arc<str>,
+        body: Text,
     },
     /// One collapsible group tied to an upstream turn number.
     Tools(u64),
@@ -43,13 +40,13 @@ pub struct Tool {
     /// The step that issued this call within its turn.
     pub step: Option<u64>,
     /// Original arguments string.
-    pub arguments: Arc<str>,
+    pub arguments: Text,
     /// Text projection of the tool's result blocks.
-    pub output: Option<Arc<str>>,
+    pub output: Option<Text>,
     /// SDK-reported failure.
     pub failed: bool,
     /// SDK-reported user-friendly error, when present.
-    pub error: Option<Arc<str>>,
+    pub error: Option<Text>,
     /// The runtime disconnected before a result was observed.
     pub interrupted: bool,
 }
@@ -84,16 +81,15 @@ pub struct Session {
     /// Latest child completion or turn outcome.
     pub outcome: Option<String>,
     /// Latest assembled assistant text for child-session previews.
-    pub summary: Option<Arc<str>>,
+    pub summary: Option<Text>,
     /// Row indexes with failed tool calls, for direct navigation.
     pub failures: BTreeMap<usize, usize>,
     /// Number of events whose meaning is not projected by this client.
     pub unhandled: usize,
     /// Increments when rows are reconstructed after a late event.
     pub generation: u64,
-    seen: HashSet<u64>,
-    ordered: BTreeMap<u64, usize>,
-    pending: BTreeMap<u64, usize>,
+    ordered: BTreeMap<u64, Record>,
+    pending: BTreeMap<u64, Record>,
     last_seq: Option<u64>,
     group_rows: HashMap<u64, usize>,
     children: Vec<String>,
@@ -102,27 +98,117 @@ pub struct Session {
 /// Raw SDK messages and their derived session views.
 #[derive(Debug, Default)]
 pub struct Conversation {
-    /// Every received message, including duplicates and unknown methods.
-    pub received: Vec<Received>,
+    archive: Archive,
     /// Projections keyed by SDK session ID.
     pub sessions: HashMap<String, Session>,
 }
 
+/// A snapshot of the journals to enumerate, without borrowing the live projection.
+pub struct History(Vec<PathBuf>);
+
+impl History {
+    /// Enumerate root sessions recorded by this Host, newest first.
+    pub fn sessions(self) -> io::Result<Vec<String>> {
+        let mut sessions = HashMap::new();
+        let mut children = HashSet::new();
+        for (run, path) in self.0.iter().enumerate() {
+            scan(path, |offset, notification| {
+                if let Some(id) = session_id(notification) {
+                    sessions.insert(id.to_owned(), (run, offset));
+                }
+                if let Some((_, child)) = child_link(notification) {
+                    children.insert(child.to_owned());
+                }
+                Ok(())
+            })?;
+        }
+        let mut sessions: Vec<_> = sessions.into_iter().collect();
+        sessions.retain(|(id, _)| !children.contains(id));
+        sessions.sort_unstable_by_key(|(_, position)| std::cmp::Reverse(*position));
+        Ok(sessions.into_iter().map(|(id, _)| id).collect())
+    }
+}
+
 impl Conversation {
+    /// Create a fresh, private archive. Earlier archives can be replayed by session.
+    pub fn open(directory: &Path, name: &str) -> io::Result<Self> {
+        Ok(Self {
+            archive: Archive::open(directory, name, true)?,
+            sessions: HashMap::new(),
+        })
+    }
+
+    /// Read a single exported DSH session without adding it to live Host history.
+    pub fn open_replay(
+        directory: &Path,
+        name: &str,
+        path: &Path,
+    ) -> io::Result<(Self, String, usize)> {
+        if !path.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an event journal file",
+            ));
+        }
+        let mut conversation = Self {
+            archive: Archive::open(directory, name, false)?,
+            sessions: HashMap::new(),
+        };
+        let source = conversation.archive.source(path)?;
+        let mut id = None;
+        let mut events = 0;
+        scan(path, |offset, notification| {
+            let Some(session) = session_id(notification) else {
+                return Ok(());
+            };
+            if id.get_or_insert_with(|| session.to_owned()) != session {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected one exported session",
+                ));
+            }
+            events += 1;
+            conversation.project(notification, Record { source, offset })
+        })?;
+        conversation.disconnect()?;
+        let id =
+            id.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no session events"))?;
+        Ok((conversation, id, events))
+    }
+
+    /// Count original inbound messages in the current run.
+    pub fn received_count(&self) -> usize {
+        self.archive.count()
+    }
+
+    /// Read a visible body through the bounded transcript cache.
+    pub fn body(&self, text: &Text) -> io::Result<Arc<String>> {
+        self.archive.body(text)
+    }
+
+    /// Ensure a clean exit persists the original inbound records.
+    pub fn sync(&self) -> io::Result<()> {
+        self.archive.sync()
+    }
+
     /// Record a host request without conflating it with a session-log event.
-    pub fn request(&mut self, request: Request) {
-        self.received.push(Received::Request(request));
+    pub fn request(&mut self, request: Request) -> io::Result<()> {
+        self.archive.append(&Frame::Request(request)).map(|_| ())
     }
 
     /// Journal first, then project recognized notifications.
-    pub fn push(&mut self, notification: Notification) {
-        let index = self.received.len();
-        self.received.push(Received::Notification(notification));
-        let Received::Notification(notification) = &self.received[index] else {
-            return;
-        };
+    pub fn push(&mut self, notification: Notification) -> io::Result<()> {
+        let frame = Frame::Notification(notification);
+        let record = self.archive.append(&frame)?;
+        if let Frame::Notification(notification) = frame {
+            self.project(&notification, record)?;
+        }
+        Ok(())
+    }
+
+    fn project(&mut self, notification: &Notification, record: Record) -> io::Result<()> {
         let Some(params) = &notification.params else {
-            return;
+            return Ok(());
         };
         let method = notification.method.as_str();
         if method == ServerNotification::SessionEvent.as_str() {
@@ -130,21 +216,23 @@ impl Conversation {
                 params["sessionId"].as_str(),
                 params["event"]["seq"].as_u64(),
             ) else {
-                return;
+                return Ok(());
             };
-            self.sessions
-                .entry(id.into())
-                .or_default()
-                .queue(seq, index, &self.received);
+            self.sessions.entry(id.into()).or_default().queue(
+                seq,
+                record,
+                &params["event"],
+                &mut self.archive,
+            )?;
         } else if method == ServerNotification::SessionStatus.as_str() {
             let Some(id) = params["sessionId"].as_str() else {
-                return;
+                return Ok(());
             };
             let session = self.sessions.entry(id.into()).or_default();
             match params["status"].as_str() {
                 Some("idle") => {
                     session.running = false;
-                    session.flush(&self.received);
+                    session.flush(&mut self.archive)?;
                 }
                 Some("running") => session.running = true,
                 _ => {}
@@ -152,11 +240,8 @@ impl Conversation {
         } else if method == ServerNotification::SubagentStarted.as_str()
             || method == ServerNotification::SubagentFinished.as_str()
         {
-            let (Some(parent), Some(child)) = (
-                params["parentSessionId"].as_str(),
-                params["childSessionId"].as_str(),
-            ) else {
-                return;
+            let Some((parent, child)) = child_link(notification) else {
+                return Ok(());
             };
             let parent_session = self.sessions.entry(parent.into()).or_default();
             if !parent_session.children.iter().any(|id| id == child) {
@@ -168,48 +253,116 @@ impl Conversation {
             if method == ServerNotification::SubagentFinished.as_str() {
                 session.running = false;
                 session.outcome = params["status"].as_str().map(str::to_owned);
-                session.flush(&self.received);
+                session.flush(&mut self.archive)?;
             } else {
                 session.running = true;
             }
         }
+        Ok(())
+    }
+
+    /// Snapshot the archive paths so history enumeration can run off the UI thread.
+    pub fn history(&self) -> io::Result<History> {
+        self.archive.paths(true).map(History)
+    }
+
+    /// Backfill a session captured by an earlier TUI launch using original records.
+    pub fn replay(&mut self, id: &str) -> io::Result<()> {
+        if self.sessions.contains_key(id) {
+            return Ok(());
+        }
+        let paths = self.archive.paths(false)?;
+        let mut children: HashMap<String, HashSet<String>> = HashMap::new();
+        for path in &paths {
+            scan(path, |_, notification| {
+                if let Some((parent, child)) = child_link(notification) {
+                    children
+                        .entry(parent.into())
+                        .or_default()
+                        .insert(child.into());
+                }
+                Ok(())
+            })?;
+        }
+        let mut wanted = HashSet::from([id.to_owned()]);
+        let mut pending = vec![id.to_owned()];
+        while let Some(parent) = pending.pop() {
+            for child in children.remove(&parent).into_iter().flatten() {
+                if wanted.insert(child.clone()) {
+                    pending.push(child);
+                }
+            }
+        }
+        for path in paths {
+            let mut source = None;
+            scan(&path, |offset, notification| {
+                if session_id(notification).is_some_and(|id| wanted.contains(id))
+                    || child_link(notification).is_some_and(|(parent, _)| wanted.contains(parent))
+                {
+                    let source = match source {
+                        Some(source) => source,
+                        None => *source.insert(self.archive.source(&path)?),
+                    };
+                    self.project(notification, Record { source, offset })?;
+                }
+                Ok(())
+            })?;
+        }
+        for id in wanted {
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.flush(&mut self.archive)?;
+                session.settle();
+            }
+        }
+        Ok(())
     }
 
     /// Apply events still waiting on a missing predecessor at a lifecycle boundary.
-    pub fn flush(&mut self) {
+    pub fn flush(&mut self) -> io::Result<()> {
         for session in self.sessions.values_mut() {
-            session.flush(&self.received);
+            session.flush(&mut self.archive)?;
         }
+        Ok(())
     }
 
     /// Settle pending projections when their runtime disconnects.
-    pub fn disconnect(&mut self) {
-        self.flush();
+    pub fn disconnect(&mut self) -> io::Result<()> {
+        self.flush()?;
         for session in self.sessions.values_mut() {
-            session.running = false;
-            for turn in session.turns.values_mut().filter(|turn| turn.running > 0) {
-                for tool in &mut turn.tools {
-                    if tool.output.is_none() {
-                        tool.interrupted = true;
-                    }
-                }
-                turn.running = 0;
-            }
+            session.settle();
         }
+        Ok(())
     }
 }
 
 impl Session {
-    fn queue(&mut self, seq: u64, index: usize, journal: &[Received]) {
-        if !self.seen.insert(seq) {
-            return;
+    fn settle(&mut self) {
+        self.running = false;
+        for turn in self.turns.values_mut().filter(|turn| turn.running > 0) {
+            for tool in &mut turn.tools {
+                if tool.output.is_none() {
+                    tool.interrupted = true;
+                }
+            }
+            turn.running = 0;
+        }
+    }
+
+    fn queue(
+        &mut self,
+        seq: u64,
+        record: Record,
+        event: &Value,
+        archive: &mut Archive,
+    ) -> io::Result<()> {
+        if self.ordered.contains_key(&seq) || self.pending.contains_key(&seq) {
+            return Ok(());
         }
         if self.last_seq.is_some_and(|last| seq < last) {
-            self.ordered.insert(seq, index);
-            self.rebuild(journal);
-            return;
+            self.ordered.insert(seq, record);
+            return self.rebuild(archive);
         }
-        self.pending.insert(seq, index);
+        self.pending.insert(seq, record);
         while let Some((&next, _)) = self.pending.first_key_value() {
             if self
                 .last_seq
@@ -218,27 +371,31 @@ impl Session {
             {
                 break;
             }
-            self.apply_next(journal);
+            self.apply_next(archive, (next == seq).then_some(event))?;
         }
+        Ok(())
     }
 
-    fn flush(&mut self, journal: &[Received]) {
+    fn flush(&mut self, archive: &mut Archive) -> io::Result<()> {
         while !self.pending.is_empty() {
-            self.apply_next(journal);
+            self.apply_next(archive, None)?;
         }
+        Ok(())
     }
 
-    fn apply_next(&mut self, journal: &[Received]) {
-        if let Some((seq, index)) = self.pending.pop_first() {
+    fn apply_next(&mut self, archive: &mut Archive, event: Option<&Value>) -> io::Result<()> {
+        if let Some((seq, record)) = self.pending.pop_first() {
             self.last_seq = Some(seq);
-            self.ordered.insert(seq, index);
-            if let Some(event) = event_at(journal, index) {
-                self.project(event);
-            }
+            self.ordered.insert(seq, record);
+            match event {
+                Some(event) => self.project(event, archive)?,
+                None => self.project(&event_at(archive, record)?, archive)?,
+            };
         }
+        Ok(())
     }
 
-    fn rebuild(&mut self, journal: &[Received]) {
+    fn rebuild(&mut self, archive: &mut Archive) -> io::Result<()> {
         self.rows.clear();
         self.turns.clear();
         self.group_rows.clear();
@@ -248,21 +405,20 @@ impl Session {
         self.unhandled = 0;
         self.generation += 1;
         let ordered = std::mem::take(&mut self.ordered);
-        for index in ordered.values() {
-            if let Some(event) = event_at(journal, *index) {
-                self.project(event);
-            }
+        for record in ordered.values() {
+            self.project(&event_at(archive, *record)?, archive)?;
         }
         self.ordered = ordered;
         self.rows
             .extend(self.children.iter().cloned().map(Row::Child));
+        Ok(())
     }
 
-    fn project(&mut self, event: &Value) {
+    fn project(&mut self, event: &Value, archive: &mut Archive) -> io::Result<()> {
         let data = &event["data"];
         match event["type"].as_str().unwrap_or("unknown") {
             "user/message" if data["source"]["kind"].as_str() == Some("user") => {
-                self.text("You", blocks(&data["content"]));
+                self.text("You", blocks(&data["content"]), archive)?;
             }
             "user/message" => {}
             "assistant/message" => {
@@ -271,7 +427,7 @@ impl Session {
                     body = stream_text(&data["stream"], "text-chunks");
                 }
                 if !body.is_empty() {
-                    let body: Arc<str> = body.into();
+                    let body = archive.text(body)?;
                     self.summary = Some(body.clone());
                     self.rows.push(Row::Text {
                         label: "Assistant",
@@ -279,24 +435,24 @@ impl Session {
                     });
                 }
                 let reasoning = stream_text(&data["stream"], "reasoning-chunks");
-                self.text("Reasoning", reasoning);
+                self.text("Reasoning", reasoning, archive)?;
                 if !data["usage"].is_null() {
                     self.usage = Some(data["usage"].clone());
                 }
                 if data["interrupted"] == true {
-                    self.text("Notice", "Assistant output interrupted".into());
+                    self.text("Notice", "Assistant output interrupted".into(), archive)?;
                 }
             }
             "turn/end" => {
                 if let Some(kind) = data["reason"]["kind"].as_str() {
                     self.outcome = Some(kind.into());
                     if !data["reason"]["error"].is_null() {
-                        self.text("Error", data["reason"]["error"].to_string());
+                        self.text("Error", data["reason"]["error"].to_string(), archive)?;
                     }
                 }
             }
-            "tool/call" => self.tool(data, false),
-            "tool/result" => self.tool(data, true),
+            "tool/call" => self.tool(data, false, archive)?,
+            "tool/result" => self.tool(data, true, archive)?,
             "turn/start" | "step/start" | "step/end" | "request/header" | "request/context"
             | "system/message" | "developer/message" | "session/end-seed" | "assistant/attempt" => {
             }
@@ -307,24 +463,26 @@ impl Session {
                     || kind.starts_with("plan/")
                     || kind.starts_with("approval/")
                 {
-                    self.text("Event", format!("{kind} · {data}"));
+                    self.text("Event", format!("{kind} · {data}"), archive)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn text(&mut self, label: &'static str, body: String) {
+    fn text(&mut self, label: &'static str, body: String, archive: &mut Archive) -> io::Result<()> {
         if !body.is_empty() {
             self.rows.push(Row::Text {
                 label,
-                body: body.into(),
+                body: archive.text(body)?,
             });
         }
+        Ok(())
     }
 
-    fn tool(&mut self, data: &Value, result: bool) {
+    fn tool(&mut self, data: &Value, result: bool, archive: &mut Archive) -> io::Result<()> {
         let Some(number) = data["turn"].as_u64() else {
-            return;
+            return Ok(());
         };
         let message = &data["message"];
         let id = if result {
@@ -332,7 +490,7 @@ impl Session {
         } else {
             data["callId"].as_str()
         };
-        let Some(id) = id else { return };
+        let Some(id) = id else { return Ok(()) };
         let row = *self.group_rows.entry(number).or_insert_with(|| {
             self.rows.push(Row::Tools(number));
             self.rows.len() - 1
@@ -348,12 +506,15 @@ impl Session {
         });
         let tool = &mut turn.tools[index];
         if result && tool.output.is_none() {
-            tool.output = Some(blocks(&message["content"]).into());
+            tool.output = Some(archive.text(blocks(&message["content"]))?);
             if !std::mem::take(&mut tool.interrupted) {
                 turn.running -= 1;
             }
             tool.failed = message["isError"] == true;
-            tool.error = data["error"]["reason"].as_str().map(Arc::from);
+            tool.error = data["error"]["reason"]
+                .as_str()
+                .map(|reason| archive.text(reason.into()))
+                .transpose()?;
             if tool.failed {
                 turn.failed += 1;
                 self.failures.entry(row).or_insert(index);
@@ -362,16 +523,82 @@ impl Session {
             tool.name = data["name"].as_str().unwrap_or("tool").into();
             tool.step = data["step"].as_u64();
             *turn.counts.entry(tool.name.clone()).or_default() += 1;
-            tool.arguments = data["arguments"].as_str().unwrap_or("").into();
+            tool.arguments = archive.text(data["arguments"].as_str().unwrap_or("").into())?;
         }
+        Ok(())
     }
 }
 
-fn event_at(journal: &[Received], index: usize) -> Option<&Value> {
-    let Received::Notification(notification) = journal.get(index)? else {
+fn event_at(archive: &mut Archive, record: Record) -> io::Result<Value> {
+    if let Frame::Notification(notification) = archive.read(record)? {
+        if let Some(Value::Object(mut params)) = notification.params {
+            if let Some(event) = params.remove("event") {
+                return Ok(event);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "archived session event is missing",
+    ))
+}
+
+fn session_id(notification: &Notification) -> Option<&str> {
+    let params = notification.params.as_ref()?;
+    match notification.method.as_str() {
+        "session.event" | "session.status" => params["sessionId"].as_str(),
+        _ => None,
+    }
+}
+
+fn child_link(notification: &Notification) -> Option<(&str, &str)> {
+    let method = notification.method.as_str();
+    if method != ServerNotification::SubagentStarted.as_str()
+        && method != ServerNotification::SubagentFinished.as_str()
+    {
         return None;
-    };
-    notification.params.as_ref()?.get("event")
+    }
+    let params = notification.params.as_ref()?;
+    Some((
+        params["parentSessionId"].as_str()?,
+        params["childSessionId"].as_str()?,
+    ))
+}
+
+fn scan(
+    path: &Path,
+    mut receive: impl FnMut(u64, &Notification) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    let mut offset = 0;
+    loop {
+        line.clear();
+        use std::io::Read;
+        reader
+            .by_ref()
+            .take(dsh_protocol::stdio::MAX_FRAME_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if line.is_empty() {
+            return Ok(());
+        }
+        if line.len() <= dsh_protocol::stdio::MAX_FRAME_BYTES && !line.ends_with(b"\n") {
+            // A process can be interrupted during the append, leaving an incomplete final record.
+            return Ok(());
+        }
+        if line.len() > dsh_protocol::stdio::MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archived frame exceeds size limit",
+            ));
+        }
+        if let Frame::Notification(notification) =
+            serde_json::from_slice(&line).map_err(io::Error::other)?
+        {
+            receive(offset, &notification)?;
+        }
+        offset += line.len() as u64;
+    }
 }
 
 fn stream_text(stream: &Value, kind: &str) -> String {
@@ -410,6 +637,37 @@ pub fn blocks(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "dsh-state-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            for entry in fs::read_dir(&self.0).into_iter().flatten().flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
 
     fn notify(method: ServerNotification, params: Value) -> Notification {
         Notification {
@@ -457,32 +715,39 @@ mod tests {
             assistant.clone(),
             unknown.clone(),
         ] {
-            chat.push(item);
+            chat.push(item).unwrap();
         }
         assert_eq!(chat.sessions["root"].rows.len(), 1);
-        chat.flush();
-        chat.push(tool.clone());
+        chat.flush().unwrap();
+        chat.push(tool.clone()).unwrap();
         let session = &chat.sessions["root"];
         assert_eq!(session.generation, 1);
         assert_eq!(session.turns[&7].tools[0].step, Some(3));
         assert_eq!(session.turns[&7].failed, 1);
         assert_eq!(session.failures.get(&1), Some(&0));
         assert_eq!(
-            session.turns[&7].tools[0].output.as_deref(),
-            Some("missing")
+            chat.body(session.turns[&7].tools[0].output.as_ref().unwrap())
+                .unwrap()
+                .as_str(),
+            "missing"
         );
-        assert_eq!(session.summary.as_deref(), Some("AB"));
+        assert_eq!(
+            chat.body(session.summary.as_ref().unwrap())
+                .unwrap()
+                .as_str(),
+            "AB"
+        );
         assert!(
-            matches!(&session.rows[3], Row::Text { label: "Reasoning", body } if &**body == "CD")
+            matches!(&session.rows[3], Row::Text { label: "Reasoning", body } if chat.body(body).unwrap().as_str() == "CD")
         );
         assert_eq!(session.unhandled, 1);
-        assert_eq!(chat.received.len(), 6);
+        assert_eq!(chat.received_count(), 6);
         assert!(
-            matches!(&chat.received[4], Received::Notification(item) if item.params == unknown.params)
+            matches!(chat.archive.read(Record { source: 0, offset: 4 }).unwrap(), Frame::Notification(item) if item.params == unknown.params)
         );
         let mut ordered = Conversation::default();
         for item in [user, tool, result, assistant, unknown] {
-            ordered.push(item);
+            ordered.push(item).unwrap();
         }
         assert_eq!(session.rows, ordered.sessions["root"].rows);
         assert_eq!(session.turns, ordered.sessions["root"].turns);
@@ -495,24 +760,147 @@ mod tests {
             ServerNotification::SubagentStarted,
             json!({"parentSessionId":"root","childSessionId":"child","agentId":"a"}),
         );
-        chat.push(started.clone());
-        chat.push(started);
+        chat.push(started.clone()).unwrap();
+        chat.push(started).unwrap();
         chat.push(event(
             8,
             "tool/call",
             json!({"turn":1,"callId":"r","name":"read"}),
-        ));
+        ))
+        .unwrap();
         assert!(chat.sessions["child"].running);
         assert_eq!(chat.sessions["child"].parent.as_deref(), Some("root"));
         chat.push(notify(
             ServerNotification::SubagentFinished,
             json!({"parentSessionId":"root","childSessionId":"child","status":"ok"}),
-        ));
-        chat.disconnect();
+        ))
+        .unwrap();
+        chat.disconnect().unwrap();
         let parent = &chat.sessions["root"];
         assert_eq!(parent.rows, [Row::Child("child".into()), Row::Tools(1)]);
         assert_eq!(parent.turns[&1].running, 0);
         assert!(parent.turns[&1].tools[0].interrupted);
         assert_eq!(chat.sessions["child"].outcome.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn disk_journal_retains_original_frames_and_reopens_after_a_torn_tail() {
+        let work = Scratch::new();
+        let path = work.0.join("01.ndjson");
+        let request = Request {
+            jsonrpc: "2.0".into(),
+            id: dsh_protocol::protocol::JsonRpcId::String("req_approval".into()),
+            method: "approval/request".into(),
+            params: Some(json!({"opaque":[1,2,3]})),
+        };
+        let unknown = event(3, "future/kind", json!({"raw":[0,1]}));
+        let mut child = event(
+            1,
+            "assistant/message",
+            json!({"message":{"content":"child body"}}),
+        );
+        child.params.as_mut().unwrap()["sessionId"] = json!("child");
+        {
+            let mut chat = Conversation::open(&work.0, "01").unwrap();
+            chat.push(notify(
+                ServerNotification::SubagentStarted,
+                json!({"parentSessionId":"root","childSessionId":"child"}),
+            ))
+            .unwrap();
+            chat.push(child).unwrap();
+            for item in [
+                unknown.clone(),
+                unknown.clone(),
+                event(
+                    2,
+                    "assistant/message",
+                    json!({"message":{"content":"older"}}),
+                ),
+            ] {
+                chat.push(item).unwrap();
+            }
+            chat.request(request.clone()).unwrap();
+            chat.push(notify(
+                ServerNotification::SubagentFinished,
+                json!({"parentSessionId":"root","childSessionId":"child","status":"ok"}),
+            ))
+            .unwrap();
+            chat.sync().unwrap();
+            assert_eq!(chat.received_count(), 7);
+            assert_eq!(chat.history().unwrap().sessions().unwrap(), ["root"]);
+        }
+        assert!(!work.0.join("01.spool").exists());
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        let records: Vec<_> =
+            std::iter::from_fn(|| dsh_protocol::stdio::read_frame(&mut reader).unwrap()).collect();
+        assert_eq!(records.len(), 7);
+        assert_eq!(records[2], Frame::Notification(unknown.clone()));
+        assert_eq!(records[3], Frame::Notification(unknown));
+        assert_eq!(records[5], Frame::Request(request));
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"jsonrpc\":")
+            .unwrap();
+
+        let mut chat = Conversation::open(&work.0, "02").unwrap();
+        assert_eq!(chat.history().unwrap().sessions().unwrap(), ["root"]);
+        chat.replay("root").unwrap();
+        chat.replay("root").unwrap();
+        let root = &chat.sessions["root"];
+        assert_eq!(root.unhandled, 1);
+        assert_eq!(root.rows.len(), 2);
+        assert_eq!(
+            chat.body(root.summary.as_ref().unwrap()).unwrap().as_str(),
+            "older"
+        );
+        let child = &chat.sessions["child"];
+        assert_eq!(child.outcome.as_deref(), Some("ok"));
+        assert_eq!(
+            chat.body(child.summary.as_ref().unwrap()).unwrap().as_str(),
+            "child body"
+        );
+        assert_eq!(chat.received_count(), 0);
+    }
+
+    #[test]
+    fn offline_replay_preserves_source_and_reloads_evicted_output() {
+        let work = Scratch::new();
+        let source = work.0.join("source.ndjson");
+        {
+            let mut chat = Conversation::open(&work.0, "source").unwrap();
+            for (seq, ch) in [(1, 'a'), (2, 'b'), (3, 'c')] {
+                chat.push(event(
+                    seq,
+                    "assistant/message",
+                    json!({"message":{"content":ch.to_string().repeat(3 * 1024 * 1024)}}),
+                ))
+                .unwrap();
+            }
+        }
+        let original = fs::read(&source).unwrap();
+        let (chat, id, events) = Conversation::open_replay(&work.0, "offline", &source).unwrap();
+        assert_eq!((id.as_str(), events), ("root", 3));
+        let Row::Text { body: first, .. } = &chat.sessions[&id].rows[0] else {
+            panic!("missing transcript body")
+        };
+        let original_body = Arc::downgrade(&chat.body(first).unwrap());
+        assert!(original_body.upgrade().is_some());
+        for row in &chat.sessions[&id].rows[1..] {
+            let Row::Text { body, .. } = row else {
+                panic!("missing transcript body")
+            };
+            assert_eq!(chat.body(body).unwrap().len(), 3 * 1024 * 1024);
+        }
+        assert!(original_body.upgrade().is_none());
+        assert_eq!(
+            chat.body(first).unwrap().as_str(),
+            "a".repeat(3 * 1024 * 1024)
+        );
+        assert!(!work.0.join("offline.ndjson").exists());
+        drop(chat);
+        assert!(!work.0.join("offline.spool").exists());
+        assert_eq!(fs::read(source).unwrap(), original);
     }
 }

@@ -5,6 +5,7 @@ mod interaction;
 use std::future::pending;
 use std::hash::{BuildHasher, RandomState};
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -39,6 +40,10 @@ enum Operation {
 enum Overlay {
     Help,
     Commands(Draft),
+    History {
+        sessions: Option<Vec<String>>,
+        selected: usize,
+    },
 }
 
 struct App {
@@ -52,6 +57,7 @@ struct App {
     config: Option<RuntimeConfig>,
     runtime: Option<RuntimeHandle>,
     operation: Option<(Operation, RpcResult)>,
+    history: Option<tokio::task::JoinHandle<io::Result<Vec<String>>>>,
     interactions: Vec<Interaction>,
     overlay: Option<Overlay>,
     status: String,
@@ -62,13 +68,19 @@ struct App {
     resume_on_ready: bool,
     alt_newline: bool,
     quit: bool,
+    archive_error: Option<io::Error>,
+    offline: bool,
 }
 
 impl App {
-    fn new(version: String, config: Result<RuntimeConfig, String>) -> Self {
+    fn new(
+        version: String,
+        config: Option<Result<RuntimeConfig, String>>,
+        conversation: Conversation,
+    ) -> Self {
         let mut app = Self {
             transport: TransportState::Detached,
-            conversation: Conversation::default(),
+            conversation,
             viewport: Viewport::default(),
             draft: Draft::default(),
             recovered: None,
@@ -77,6 +89,7 @@ impl App {
             config: None,
             runtime: None,
             operation: None,
+            history: None,
             interactions: Vec::new(),
             overlay: None,
             status: String::new(),
@@ -87,10 +100,13 @@ impl App {
             resume_on_ready: false,
             alt_newline: std::env::var("DSH_TUI_NEWLINE").as_deref() == Ok("alt-enter"),
             quit: false,
+            archive_error: None,
+            offline: config.is_none(),
         };
         match config {
-            Ok(config) => app.start(config),
-            Err(error) => app.transport = TransportState::Failed(error),
+            Some(Ok(config)) => app.start(config),
+            Some(Err(error)) => app.transport = TransportState::Failed(error),
+            None => app.route = "Offline replay".into(),
         }
         app
     }
@@ -134,8 +150,27 @@ impl App {
             }),
             Some(Overlay::Commands(input)) => Some(Modal {
                 title: " Commands ",
-                body: "/new   /resume ID   /cwd   /route PROVIDER MODEL\n/view ID   /back   /failure   /draft   /help   /quit\nType a command and press Enter.".into(),
+                body: if self.offline {
+                    "/failure   /help   /quit\nOffline: Agent and tools are disabled."
+                } else {
+                    "/new   /history   /resume ID   /cwd   /route PROVIDER MODEL\n/view ID   /back   /failure   /draft   /help   /quit\nType a command and press Enter."
+                }.into(),
                 input: Some(input),
+            }),
+            Some(Overlay::History { sessions, selected }) => Some(Modal {
+                title: " Local Host History ",
+                body: match sessions {
+                    None => "Reading local archives · Esc closes".into(),
+                    Some(sessions) if sessions.is_empty() => "No archived TUI sessions yet".into(),
+                    Some(sessions) => {
+                        let start = selected.saturating_sub(5);
+                        let rows = sessions.iter().enumerate().skip(start).take(7).map(|(index, id)| {
+                            format!("{} {id}", if index == *selected { ">" } else { " " })
+                        }).collect::<Vec<_>>().join("\n");
+                        format!("↑/↓ select · Enter resumes · Esc closes\n{rows}")
+                    }
+                },
+                input: None,
             }),
             None => None,
         });
@@ -150,7 +185,14 @@ impl App {
             draft: &self.draft,
             modal,
         };
-        terminal.draw(|frame| screen::draw(frame, &screen, &self.conversation, &mut self.viewport))
+        let started = Instant::now();
+        let result = terminal
+            .draw(|frame| screen::draw(frame, &screen, &self.conversation, &mut self.viewport));
+        tracing::debug!(
+            draw_us = started.elapsed().as_micros() as u64,
+            "terminal draw"
+        );
+        result
     }
 
     fn call(
@@ -176,6 +218,10 @@ impl App {
     }
 
     fn submit(&mut self) {
+        if self.offline {
+            self.status = "Offline replay · prompts are disabled".into();
+            return;
+        }
         if self.draft.text().trim().is_empty() || self.busy() {
             return;
         }
@@ -233,7 +279,11 @@ impl App {
                 );
             }
             (Operation::Wait, Ok(_)) => {
-                self.conversation.flush();
+                let flushed = self
+                    .conversation
+                    .flush()
+                    .and_then(|()| self.conversation.sync());
+                self.archive_result(flushed);
                 self.status = "Turn finished".into();
             }
             (Operation::Wait, Err(error)) => self.status = error,
@@ -242,7 +292,7 @@ impl App {
                 self.attached = true;
                 self.viewed = None;
                 self.viewport.reset();
-                self.status = "Session resumed · SDK supplies new events".into();
+                self.status = "Session resumed".into();
             }
             (Operation::Cwd, Ok(result)) => {
                 if let Some(cwd) = result["cwd"].as_str() {
@@ -269,7 +319,8 @@ impl App {
                 self.inbound(frame);
             }
             self.status = error.clone();
-            self.conversation.disconnect();
+            let settled = self.conversation.disconnect();
+            self.archive_result(settled);
             self.interactions.clear();
         }
         self.transport = state;
@@ -291,9 +342,15 @@ impl App {
                             .retain(|item| item.request_id() != Some(request_id));
                     }
                 }
-                self.conversation.push(notification);
+                let recorded = self.conversation.push(notification);
+                self.archive_result(recorded);
             }
             Frame::Request(request) => {
+                let recorded = self.conversation.request(request.clone());
+                if recorded.is_err() {
+                    self.archive_result(recorded);
+                    return;
+                }
                 if let Some(deadline) = inbound.interaction_deadline {
                     if let Some(interaction) = Interaction::from_request(&request, deadline) {
                         if deadline > Instant::now() {
@@ -309,9 +366,17 @@ impl App {
                         let _ = runtime.answer(request.id.clone(), cancelled);
                     }
                 }
-                self.conversation.request(request);
             }
             Frame::Response(_) => {}
+        }
+    }
+
+    fn archive_result(&mut self, result: io::Result<()>) {
+        if let Err(error) = result {
+            self.archive_error.get_or_insert_with(|| {
+                io::Error::new(error.kind(), format!("Host archive failed: {error}"))
+            });
+            self.quit = true;
         }
     }
 
@@ -325,7 +390,11 @@ impl App {
             }
         }
         self.interactions.clear();
-        self.conversation.disconnect();
+        let settled = self.conversation.disconnect();
+        self.archive_result(settled);
+        if self.quit {
+            return;
+        }
         self.resume_on_ready = self.attached;
         self.status = if interrupt {
             "Task interrupted · reconnecting"
@@ -337,6 +406,10 @@ impl App {
     }
 
     fn resume(&mut self, id: String) {
+        if let Err(error) = self.conversation.replay(&id) {
+            self.status = format!("History replay failed: {error}");
+            return;
+        }
         if let Err(error) = self.call(
             Operation::Resume(id.clone()),
             ClientMethod::SessionResume,
@@ -358,6 +431,7 @@ impl App {
                     self.status = "No failed tool in this view".into();
                 }
             }
+            _ if self.offline => self.status = "Unavailable in offline replay".into(),
             ["/draft"] if self.draft.text().is_empty() => {
                 if let Some(text) = self.recovered.take() {
                     self.draft.replace(text);
@@ -371,7 +445,9 @@ impl App {
                 self.viewed = None;
                 self.viewport.reset();
             }
-            ["/new" | "/resume" | "/route", ..] if self.busy() || self.operation.is_some() => {
+            ["/new" | "/history" | "/resume" | "/route", ..]
+                if self.busy() || self.operation.is_some() =>
+            {
                 self.status = "Finish or interrupt the active request first".into();
             }
             ["/new"] => {
@@ -382,6 +458,19 @@ impl App {
                 self.status = "New session".into();
             }
             ["/resume", id] => self.resume((*id).into()),
+            ["/history"] => match self.conversation.history() {
+                Ok(history) => {
+                    if self.history.is_none() {
+                        self.history =
+                            Some(tokio::task::spawn_blocking(move || history.sessions()));
+                    }
+                    self.overlay = Some(Overlay::History {
+                        sessions: None,
+                        selected: 0,
+                    })
+                }
+                Err(error) => self.status = format!("History scan failed: {error}"),
+            },
             ["/cwd"] => {
                 if let Err(error) = self.call(
                     Operation::Cwd,
@@ -424,6 +513,24 @@ impl App {
         if let Some(overlay) = &mut self.overlay {
             if key.code == KeyCode::Esc || ctrl && key.code == KeyCode::Char('c') {
                 self.overlay = None;
+            } else if let Overlay::History {
+                sessions: Some(sessions),
+                selected,
+            } = overlay
+            {
+                match key.code {
+                    KeyCode::Up => *selected = selected.saturating_sub(1),
+                    KeyCode::Down => {
+                        *selected = (*selected + 1).min(sessions.len().saturating_sub(1))
+                    }
+                    KeyCode::Enter => {
+                        if let Some(id) = sessions.get(*selected).cloned() {
+                            self.overlay = None;
+                            self.resume(id);
+                        }
+                    }
+                    _ => {}
+                }
             } else if let Overlay::Commands(draft) = overlay {
                 if key.code == KeyCode::Enter {
                     let command = draft.text().to_owned();
@@ -543,9 +650,34 @@ fn edit_key(draft: &mut Draft, key: KeyEvent, alt_newline: bool) -> bool {
     true
 }
 
-pub async fn run(state: AppState, config: Result<RuntimeConfig, String>) -> io::Result<()> {
+pub async fn run(state: AppState, replay: Option<PathBuf>) -> io::Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let name = format!("{:032}-{}", stamp.as_nanos(), new_session());
+    let root = crate::build_info::workspace_root();
+    let mut app = if let Some(path) = replay {
+        let started = Instant::now();
+        let (conversation, id, events) =
+            Conversation::open_replay(&root.join(".dsh-tui/replay"), &name, &path)?;
+        tracing::debug!(
+            events,
+            replay_us = started.elapsed().as_micros() as u64,
+            "offline replay loaded"
+        );
+        let mut app = App::new(state.agent_version, None, conversation);
+        app.session = id;
+        app.status = format!("Offline replay · {events} recorded events");
+        app
+    } else {
+        let conversation = Conversation::open(&root.join(".dsh-tui/history"), &name)?;
+        App::new(
+            state.agent_version,
+            Some(RuntimeConfig::load(&root)),
+            conversation,
+        )
+    };
     let mut terminal = TerminalSession::enter()?;
-    let mut app = App::new(state.agent_version, config);
     let (sender, receiver) = mpsc::channel(64);
     let reader = std::thread::Builder::new()
         .name("dsh-tui-input".into())
@@ -576,7 +708,11 @@ pub async fn run(state: AppState, config: Result<RuntimeConfig, String>) -> io::
             tracing::warn!(%error, "SDK shutdown used process cleanup");
         }
     }
-    result.and(restored)
+    let synced = app.conversation.sync();
+    result
+        .and(restored)
+        .and(app.archive_error.map_or(Ok(()), Err))
+        .and(synced)
 }
 
 enum SdkEvent {
@@ -622,6 +758,23 @@ async fn event_loop(
                     None => pending().await,
                 }
             } => app.reply(reply),
+            history = async {
+                match &mut app.history {
+                    Some(task) => task.await.map_err(io::Error::other).and_then(|result| result),
+                    None => pending().await,
+                }
+            } => {
+                app.history = None;
+                if let Some(Overlay::History { sessions, .. }) = &mut app.overlay {
+                    match history {
+                        Ok(found) => *sessions = Some(found),
+                        Err(error) => {
+                            app.overlay = None;
+                            app.status = format!("History scan failed: {error}");
+                        }
+                    }
+                }
+            },
             _ = async {
                 match expires {
                     Some(deadline) => tokio::time::sleep_until(deadline.into()).await,

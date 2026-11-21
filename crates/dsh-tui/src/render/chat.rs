@@ -1,7 +1,7 @@
 //! Viewport traversal and bounded, lazy text layout.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use dsh_state::conversation::{Conversation, Row, Session};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -15,6 +15,8 @@ use unicode_width::UnicodeWidthStr;
 
 const CHUNK_BYTES: usize = 4096;
 const CACHE_SIZE: usize = 96;
+const LAYOUT_BUDGET: usize = 4 * 1024 * 1024;
+const FENCE_BUDGET: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Default)]
 pub enum Mode {
@@ -61,27 +63,30 @@ pub struct Viewport {
     tools: HashMap<(String, u64, String), bool>,
     children: HashSet<(String, String)>,
     layouts: VecDeque<Layout>,
-    fences: VecDeque<(Arc<str>, Vec<usize>)>,
+    fences: VecDeque<(Weak<String>, Vec<usize>)>,
+    layout_bytes: usize,
+    fence_bytes: usize,
     generations: HashMap<String, u64>,
     size: (u16, usize),
 }
 
 struct Layout {
-    body: Arc<str>,
+    body: Weak<String>,
     chunk: usize,
     width: u16,
     markdown: bool,
     lines: Vec<Line<'static>>,
+    bytes: usize,
 }
 
 struct Piece {
-    body: Arc<str>,
+    body: Arc<String>,
     color: Color,
     markdown: bool,
 }
 
 impl Piece {
-    fn new(body: impl Into<Arc<str>>, color: Color) -> Self {
+    fn new(body: impl Into<Arc<String>>, color: Color) -> Self {
         Self {
             body: body.into(),
             color,
@@ -331,7 +336,7 @@ impl Viewport {
     ) -> Option<Piece> {
         Some(match &session.rows[pos.row] {
             Row::Text { label, .. } if pos.part == 0 => Piece::new(
-                *label,
+                label.to_string(),
                 match *label {
                     "You" => Color::Cyan,
                     "Error" => Color::LightRed,
@@ -340,7 +345,7 @@ impl Viewport {
                 },
             ),
             Row::Text { body, .. } => Piece {
-                body: body.clone(),
+                body: load_body(conversation, body),
                 color: Color::Reset,
                 markdown: true,
             },
@@ -397,7 +402,7 @@ impl Viewport {
                         } else {
                             &tool.name
                         };
-                        let args = excerpt(&tool.arguments, 110);
+                        let args = excerpt(&load_body(conversation, &tool.arguments), 110);
                         let step = match tool.step {
                             Some(step)
                                 if matches!(self.mode, Mode::Normal)
@@ -421,13 +426,19 @@ impl Viewport {
                         )
                     }
                     1 if open && !tool.arguments.is_empty() => {
-                        Piece::new(tool.arguments.clone(), Color::DarkGray)
+                        Piece::new(load_body(conversation, &tool.arguments), Color::DarkGray)
                     }
-                    2 if open => Piece::new(tool.output.as_ref()?.clone(), Color::Reset),
-                    2 if matches!(self.mode, Mode::Normal) => {
-                        Piece::new(excerpt(tool.output.as_ref()?, 240), Color::DarkGray)
+                    2 if open => {
+                        Piece::new(load_body(conversation, tool.output.as_ref()?), Color::Reset)
                     }
-                    3 if open => Piece::new(tool.error.as_ref()?.clone(), Color::LightRed),
+                    2 if matches!(self.mode, Mode::Normal) => Piece::new(
+                        excerpt(&load_body(conversation, tool.output.as_ref()?), 240),
+                        Color::DarkGray,
+                    ),
+                    3 if open => Piece::new(
+                        load_body(conversation, tool.error.as_ref()?),
+                        Color::LightRed,
+                    ),
                     _ => return None,
                 }
             }
@@ -455,7 +466,7 @@ impl Viewport {
                     );
                     if let Some(body) = &child_state.summary {
                         summary.push('\n');
-                        summary.push_str(&excerpt(body, 500));
+                        summary.push_str(&excerpt(&load_body(conversation, body), 500));
                     }
                     Piece::new(summary, Color::Gray)
                 }
@@ -538,8 +549,9 @@ impl Viewport {
 
     fn layout(&mut self, piece: &Piece, chunk: usize) -> &[Line<'static>] {
         let width = self.size.0.max(1);
+        let body = Arc::downgrade(&piece.body);
         if let Some(index) = self.layouts.iter().position(|entry| {
-            Arc::ptr_eq(&entry.body, &piece.body)
+            Weak::ptr_eq(&entry.body, &body)
                 && entry.width == width
                 && entry.markdown == piece.markdown
                 && entry.chunk == chunk
@@ -559,43 +571,92 @@ impl Viewport {
             in_fence,
             start == 0 || piece.body.as_bytes()[start - 1] == b'\n',
         );
-        if self.layouts.len() == CACHE_SIZE {
-            self.layouts.pop_front();
+        let bytes = lines.capacity() * size_of::<Line<'static>>()
+            + lines
+                .iter()
+                .map(|line| {
+                    line.spans.capacity() * size_of::<Span<'static>>()
+                        + line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        while self.layouts.len() >= CACHE_SIZE || self.layout_bytes + bytes > LAYOUT_BUDGET {
+            let Some(old) = self.layouts.pop_front() else {
+                break;
+            };
+            self.layout_bytes -= old.bytes;
         }
+        self.layout_bytes += bytes;
         self.layouts.push_back(Layout {
-            body: piece.body.clone(),
+            body,
             chunk,
             width,
             markdown: piece.markdown,
             lines,
+            bytes,
         });
         // Just inserted, even when the ring was full.
         &self.layouts[self.layouts.len() - 1].lines
     }
 
-    fn in_fence(&mut self, body: &Arc<str>, at: usize) -> bool {
+    fn in_fence(&mut self, body: &Arc<String>, at: usize) -> bool {
+        let source = Arc::downgrade(body);
         let fences = if let Some(index) = self
             .fences
             .iter()
-            .position(|(text, _)| Arc::ptr_eq(text, body))
+            .position(|(text, _)| Weak::ptr_eq(text, &source))
         {
             &self.fences[index].1
         } else {
-            let fences = body
-                .match_indices("```")
-                .filter_map(|(index, _)| {
-                    let start = body[..index].rfind('\n').map_or(0, |i| i + 1);
-                    body[start..index].trim().is_empty().then_some(index)
-                })
-                .collect();
-            if self.fences.len() == 16 {
-                self.fences.pop_front();
+            let mut offset = 0;
+            let mut fences = Vec::new();
+            let mut odd = false;
+            for line in body.split_inclusive('\n') {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    let index = offset + line.len() - trimmed.len();
+                    odd ^= index < at;
+                    if fences.len() < FENCE_BUDGET / size_of::<usize>() {
+                        fences.push(index);
+                    } else {
+                        // Unusually dense fence sources are scanned without adding a cache entry.
+                        offset += line.len();
+                        for line in body[offset..].split_inclusive('\n') {
+                            if offset >= at {
+                                break;
+                            }
+                            let trimmed = line.trim_start();
+                            odd ^= trimmed.starts_with("```")
+                                && offset + line.len() - trimmed.len() < at;
+                            offset += line.len();
+                        }
+                        return odd;
+                    }
+                }
+                offset += line.len();
             }
-            self.fences.push_back((Arc::clone(body), fences));
+            let bytes = fences.capacity() * size_of::<usize>();
+            while self.fences.len() >= 16 || self.fence_bytes + bytes > FENCE_BUDGET {
+                let Some((_, old)) = self.fences.pop_front() else {
+                    break;
+                };
+                self.fence_bytes -= old.capacity() * size_of::<usize>();
+            }
+            self.fence_bytes += bytes;
+            self.fences.push_back((source, fences));
             &self.fences[self.fences.len() - 1].1
         };
         fences.partition_point(|offset| *offset < at) % 2 != 0
     }
+}
+
+fn load_body(conversation: &Conversation, text: &dsh_state::conversation::Text) -> Arc<String> {
+    conversation
+        .body(text)
+        .unwrap_or_else(|error| format!("Transcript read failed: {error}").into())
 }
 
 fn flip<T: Eq + std::hash::Hash>(set: &mut HashSet<T>, item: T) {

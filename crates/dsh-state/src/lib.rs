@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod activity;
+mod archive;
 pub mod conversation;
 pub mod draft;
 pub mod session;

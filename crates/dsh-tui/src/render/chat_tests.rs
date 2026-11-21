@@ -7,11 +7,13 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 fn event(conversation: &mut Conversation, seq: u64, kind: &str, data: Value) {
-    conversation.push(Notification {
-        jsonrpc: "2.0".into(),
-        method: ServerNotification::SessionEvent.as_str().into(),
-        params: Some(json!({"sessionId":"s","event":{"seq":seq,"type":kind,"data":data}})),
-    });
+    conversation
+        .push(Notification {
+            jsonrpc: "2.0".into(),
+            method: ServerNotification::SessionEvent.as_str().into(),
+            params: Some(json!({"sessionId":"s","event":{"seq":seq,"type":kind,"data":data}})),
+        })
+        .unwrap();
 }
 
 fn message(conversation: &mut Conversation, seq: u64, text: &str) {
@@ -124,7 +126,12 @@ fn percentiles(samples: &mut [Duration]) -> [f64; 3] {
 #[test]
 #[ignore = "run explicitly in release mode for performance measurements"]
 fn benchmark_chat() {
-    let mut conversation = Conversation::default();
+    let mut conversation = match std::env::var_os("DSH_BENCH_ARCHIVE") {
+        Some(directory) => {
+            Conversation::open(std::path::Path::new(&directory), "benchmark").unwrap()
+        }
+        None => Conversation::default(),
+    };
     let long = format!(
         "# Long answer\n\n```rust\n{}```\n",
         "let example = 1;\n".repeat(16_384)
@@ -161,7 +168,7 @@ fn benchmark_chat() {
         seq += 2;
     }
     let ingest = start.elapsed();
-    assert_eq!(conversation.received.len(), 100_000);
+    assert_eq!(conversation.received_count(), 100_000);
     let mut view = Viewport {
         mode: Mode::Verbose,
         ..Viewport::default()

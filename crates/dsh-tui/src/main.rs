@@ -9,6 +9,7 @@ mod runtime;
 mod terminal;
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use dsh_protocol::lock::{DEFAULT_LOCK_PATH, RuntimeLock};
 use dsh_state::AppState;
@@ -19,7 +20,7 @@ const DEFAULT_LOG_DIR: &str = ".dsh-tui";
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    if matches!(args.as_slice(), [arg] if arg == "--version" || arg == "-V") {
         println!(
             "LingXi DSH TUI {} ({})",
             build_info::VERSION,
@@ -27,14 +28,14 @@ async fn main() -> std::process::ExitCode {
         );
         return std::process::ExitCode::SUCCESS;
     }
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if matches!(args.as_slice(), [arg] if arg == "--help" || arg == "-h") {
         println!(
-            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime]\n\n  --check-runtime  verify bundled SDK initialization and shutdown\n  Ctrl+P           command palette\n  Ctrl+J           insert newline\n  /quit            quit",
+            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime | --replay-journal FILE]\n\n  --check-runtime       verify bundled SDK initialization and shutdown\n  --replay-journal FILE view one exported session without starting the SDK\n  Ctrl+P                command palette\n  Ctrl+J                insert newline\n  /quit                 quit",
             build_info::VERSION
         );
         return std::process::ExitCode::SUCCESS;
     }
-    if args.iter().any(|arg| arg == "--check-runtime") {
+    if matches!(args.as_slice(), [arg] if arg == "--check-runtime") {
         init_logging();
         return match check_runtime().await {
             Ok(()) => std::process::ExitCode::SUCCESS,
@@ -44,6 +45,14 @@ async fn main() -> std::process::ExitCode {
             }
         };
     }
+    let replay = match args.as_slice() {
+        [] => None,
+        [flag, path] if flag == "--replay-journal" => Some(PathBuf::from(path)),
+        _ => {
+            eprintln!("invalid arguments; see dsh-tui --help");
+            return std::process::ExitCode::from(2);
+        }
+    };
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         eprintln!("dsh-tui needs an interactive terminal (stdin and stdout are not a TTY)");
         return std::process::ExitCode::from(2);
@@ -59,8 +68,7 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    let config = runtime::RuntimeConfig::load(&build_info::workspace_root());
-    match app::run(state, config).await {
+    match app::run(state, replay).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("dsh-tui failed: {error}");
