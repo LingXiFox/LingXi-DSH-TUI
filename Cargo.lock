@@ -197,6 +197,8 @@ name = "dsh-state"
 version = "0.2.2-rc.5"
 dependencies = [
  "dsh-protocol",
+ "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -207,9 +209,12 @@ dependencies = [
  "dsh-protocol",
  "dsh-state",
  "ratatui",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

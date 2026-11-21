@@ -29,7 +29,7 @@ async fn main() -> std::process::ExitCode {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime]\n\n  --check-runtime  verify bundled SDK initialization and shutdown\n  q / Esc         quit\n  ?               toggle key help\n  f               fold or expand tool rows",
+            "LingXi DSH TUI {}\n\nUsage: dsh-tui [--version | --check-runtime]\n\n  --check-runtime  verify bundled SDK initialization and shutdown\n  Ctrl+P           command palette\n  Ctrl+J           insert newline\n  /quit            quit",
             build_info::VERSION
         );
         return std::process::ExitCode::SUCCESS;
@@ -100,7 +100,10 @@ async fn check_runtime() -> Result<(), String> {
             None => break Err("runtime worker closed without a handshake result".into()),
         }
     };
-    let shutdown = runtime.shutdown().await.map_err(|error| error.to_string());
+    let shutdown = runtime
+        .shutdown(|_| {})
+        .await
+        .map_err(|error| error.to_string());
     result.and(shutdown)?;
     println!("SDK shutdown: ok");
     Ok(())

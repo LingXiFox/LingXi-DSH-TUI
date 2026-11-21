@@ -27,16 +27,6 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .split(rows[1])[1]
 }
 
-/// Whether a terminal is large enough for the comfortable layout.
-pub fn is_usable(area: Rect) -> bool {
-    area.width >= MIN_WIDTH && area.height >= MIN_HEIGHT
-}
-
-/// Width below which the side panel crowds the activity log.
-pub const MIN_WIDTH: u16 = 60;
-/// Minimum height for the full layout.
-pub const MIN_HEIGHT: u16 = 16;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,12 +49,5 @@ mod tests {
         assert_eq!(popup.height, 8);
         assert_eq!(popup.x, 0);
         assert_eq!(popup.y, 0);
-    }
-
-    #[test]
-    fn usability_threshold_is_explicit() {
-        assert!(is_usable(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT)));
-        assert!(!is_usable(Rect::new(0, 0, MIN_WIDTH - 1, MIN_HEIGHT)));
-        assert!(!is_usable(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT - 1)));
     }
 }

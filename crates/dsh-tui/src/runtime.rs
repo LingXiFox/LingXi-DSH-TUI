@@ -1,5 +1,6 @@
 //! Official SDK child-process lifecycle. Wire encoding belongs to dsh-protocol.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
@@ -10,24 +11,54 @@ use std::time::{Duration, Instant};
 
 use dsh_protocol::RuntimeLock;
 use dsh_protocol::protocol::{
-    ClientCapabilities, DEFAULT_INITIALIZE_TIMEOUT_SECS, Frame, InitializeParams, InitializeResult,
-    JsonRpcId, RUNTIME_SERVER_NAME,
+    ClientCapabilities, ClientMethod, DEFAULT_INITIALIZE_TIMEOUT_SECS, Frame, InitializeParams,
+    InitializeResult, JsonRpcId, METHOD_APPROVAL_REQUEST, METHOD_USER_QUESTION,
+    RUNTIME_SERVER_NAME, Response,
 };
-use dsh_protocol::stdio::{initialize_request, read_frame, shutdown_request, write_frame};
+use dsh_protocol::stdio::{initialize_request, read_frame, request, shutdown_request, write_frame};
 use dsh_state::TransportState;
+use serde_json::{Value, json};
+use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 const POLL: Duration = Duration::from_millis(25);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const QUEUE: usize = 32;
+const RPC_LIMIT: usize = 32;
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub type RpcResult = oneshot::Receiver<Result<Response, String>>;
+
+enum Outbound {
+    Call {
+        method: ClientMethod,
+        params: Value,
+        deadline: Instant,
+        reply: oneshot::Sender<Result<Response, String>>,
+    },
+    Answer(JsonRpcId, Value),
+}
+
+struct WorkerQueues {
+    stop: mpsc::Receiver<()>,
+    outbound: mpsc::Receiver<Outbound>,
+    events: async_mpsc::UnboundedSender<TransportState>,
+    inbox: async_mpsc::Sender<Inbound>,
+}
+
+pub struct Inbound {
+    pub frame: Frame,
+    pub interaction_deadline: Option<Instant>,
+}
 
 /// Resolved on-disk bundle and route. Launch never installs or fetches anything.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     entry: PathBuf,
-    cwd: PathBuf,
+    pub cwd: PathBuf,
     home: PathBuf,
     stderr: PathBuf,
-    provider: String,
-    model: String,
+    pub provider: String,
+    pub model: String,
     initialize_timeout: Duration,
 }
 
@@ -72,10 +103,11 @@ impl RuntimeConfig {
         let mut command = Command::new("node");
         command
             .arg(&self.entry)
-            .args(["--profile", "sdk-minimal"])
+            .args(["--profile", "sdk"])
             .current_dir(&self.cwd)
             .env("DSH_HOME", &self.home)
-            .env("DSH_TELEMETRY_DISABLED", "1");
+            .env("DSH_TELEMETRY_DISABLED", "1")
+            .env("DSH_PERMISSION_MODE", "workspace-write");
         command
     }
 
@@ -86,8 +118,10 @@ impl RuntimeConfig {
             model: self.model.clone(),
             reasoning_effort: None,
             max_tokens: None,
-            approval_requests: Some(false),
-            capabilities: ClientCapabilities::default(),
+            approval_requests: Some(true),
+            capabilities: ClientCapabilities {
+                user_questions: true,
+            },
         }
     }
 }
@@ -95,35 +129,79 @@ impl RuntimeConfig {
 /// One owned child and its transport-state notifications.
 pub struct RuntimeHandle {
     stop: mpsc::Sender<()>,
+    outbound: mpsc::SyncSender<Outbound>,
     worker: Option<thread::JoinHandle<Result<(), String>>>,
     pub events: tokio::sync::mpsc::UnboundedReceiver<TransportState>,
+    pub inbox: async_mpsc::Receiver<Inbound>,
 }
 
 impl RuntimeHandle {
     pub fn start(config: RuntimeConfig) -> io::Result<Self> {
         let (stop, stopped) = mpsc::channel();
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (outbound, outgoing) = mpsc::sync_channel(QUEUE);
+        let (inbox, incoming) = async_mpsc::channel(QUEUE);
         let worker = thread::Builder::new()
             .name("dsh-runtime".into())
             .spawn(move || {
-                let _ = events.send(TransportState::Connecting);
-                let result = run_child(&config, config.command(), &stopped, &events);
+                let queues = WorkerQueues {
+                    stop: stopped,
+                    outbound: outgoing,
+                    events,
+                    inbox,
+                };
+                let _ = queues.events.send(TransportState::Connecting);
+                let result = run_child(&config, config.command(), &queues);
                 if let Err(error) = &result {
                     tracing::warn!(%error, "SDK runtime stopped");
-                    let _ = events.send(TransportState::Failed(error.clone()));
+                    let _ = queues.events.send(TransportState::Failed(error.clone()));
                 }
                 result
             })?;
         Ok(Self {
             stop,
+            outbound,
             worker: Some(worker),
             events: receiver,
+            inbox: incoming,
         })
     }
 
-    pub async fn shutdown(mut self) -> io::Result<()> {
+    pub fn call(
+        &self,
+        method: ClientMethod,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<RpcResult, String> {
+        let (reply, result) = oneshot::channel();
+        self.enqueue(Outbound::Call {
+            method,
+            params,
+            deadline: Instant::now() + timeout,
+            reply,
+        })?;
+        Ok(result)
+    }
+
+    pub fn answer(&self, id: JsonRpcId, result: Value) -> Result<(), String> {
+        self.enqueue(Outbound::Answer(id, result))
+    }
+
+    fn enqueue(&self, outbound: Outbound) -> Result<(), String> {
+        self.outbound
+            .try_send(outbound)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => "SDK request queue is full".into(),
+                mpsc::TrySendError::Disconnected(_) => "SDK transport is closed".into(),
+            })
+    }
+
+    pub async fn shutdown(mut self, mut receive: impl FnMut(Inbound)) -> io::Result<()> {
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() {
+            while let Some(frame) = self.inbox.recv().await {
+                receive(frame);
+            }
             tokio::task::spawn_blocking(move || worker.join())
                 .await
                 .map_err(io::Error::other)?
@@ -147,8 +225,7 @@ fn stopped(receiver: &mpsc::Receiver<()>) -> bool {
 fn run_child(
     config: &RuntimeConfig,
     mut command: Command,
-    stop: &mpsc::Receiver<()>,
-    events: &tokio::sync::mpsc::UnboundedSender<TransportState>,
+    queues: &WorkerQueues,
 ) -> Result<(), String> {
     std::fs::create_dir_all(&config.home).map_err(|error| error.to_string())?;
     let log = File::create(&config.stderr).map_err(|error| error.to_string())?;
@@ -158,7 +235,7 @@ fn run_child(
         .stderr(log)
         .spawn()
         .map_err(|error| format!("could not start bundled runtime: {error}"))?;
-    let result = exchange(&mut child, config, stop, events);
+    let result = exchange(&mut child, config, queues);
     // Every return path owns cleanup, including spawn setup and handshake failures.
     if !matches!(child.try_wait(), Ok(Some(_))) {
         let _ = child.kill();
@@ -172,13 +249,12 @@ fn run_child(
 fn exchange(
     child: &mut Child,
     config: &RuntimeConfig,
-    stop: &mpsc::Receiver<()>,
-    events: &tokio::sync::mpsc::UnboundedSender<TransportState>,
+    queues: &WorkerQueues,
 ) -> Result<(), String> {
     let mut stdin = child.stdin.take().ok_or("runtime stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("runtime stdout unavailable")?;
-    let (frames, incoming) = mpsc::sync_channel(64);
-    let (requests, outgoing) = mpsc::channel();
+    let (frames, incoming) = mpsc::sync_channel(QUEUE);
+    let (requests, outgoing) = mpsc::sync_channel(QUEUE);
     let write_errors = frames.clone();
     // Pipe writes run separately so even a child that never reads stdin can be
     // cancelled and killed by the lifecycle worker within its deadline.
@@ -209,25 +285,31 @@ fn exchange(
         })
         .map_err(|error| error.to_string())?;
 
-    let initialize_id = JsonRpcId::Number(1.into());
-    requests
-        .send(initialize_request(initialize_id.clone(), &config.params()))
-        .map_err(|error| format!("initialize write failed: {error}"))?;
+    let initialize_id = JsonRpcId::from(1);
+    send(
+        &requests,
+        initialize_request(initialize_id.clone(), &config.params()),
+    )?;
     let mut deadline = Instant::now() + config.initialize_timeout;
     let mut ready = false;
     let mut shutting_down = false;
-    let shutdown_id = JsonRpcId::Number(2.into());
+    let shutdown_id = JsonRpcId::from(2);
     let mut shutdown_acknowledged = false;
+    let mut next_id = 3;
+    let mut calls: HashMap<u64, PendingCall> = HashMap::new();
+    let mut interactions: Vec<PendingInteraction> = Vec::new();
+    let mut deliver = None;
     loop {
-        if stopped(stop) && !shutting_down {
+        if stopped(&queues.stop) && !shutting_down {
             if !ready {
                 return Ok(());
             }
-            requests
-                .send(shutdown_request(shutdown_id.clone()))
-                .map_err(|error| format!("shutdown write failed: {error}"))?;
+            send(&requests, shutdown_request(shutdown_id.clone()))?;
             shutting_down = true;
             deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            for (_, call) in calls.drain() {
+                let _ = call.reply.send(Err("SDK is shutting down".into()));
+            }
         }
         if (!ready || shutting_down) && Instant::now() >= deadline {
             return Err(if shutting_down {
@@ -236,6 +318,82 @@ fn exchange(
                 "runtime initialize timed out"
             }
             .into());
+        }
+        if ready && !shutting_down {
+            let now = Instant::now();
+            calls.retain(|_, call| !call.reply.is_closed());
+            let expired = calls.iter().find(|(_, call)| now >= call.deadline);
+            if let Some((&id, call)) = expired {
+                let error = format!(
+                    "SDK {} timed out; its outcome is unknown",
+                    call.method.as_str()
+                );
+                if let Some(call) = calls.remove(&id) {
+                    let _ = call.reply.send(Err(error));
+                }
+            }
+            if let Some(index) = interactions.iter().position(|item| now >= item.deadline) {
+                let item = interactions.remove(index);
+                send(
+                    &requests,
+                    Response::success(
+                        item.id,
+                        if item.question.is_none() {
+                            json!({"outcome":"cancelled"})
+                        } else {
+                            json!({"cancelled":true})
+                        },
+                    ),
+                )?;
+            }
+            if let Ok(outbound) = queues.outbound.try_recv() {
+                match outbound {
+                    Outbound::Call {
+                        method,
+                        params,
+                        deadline,
+                        reply,
+                    } => {
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        if calls.len() >= RPC_LIMIT || now >= deadline {
+                            let _ = reply.send(Err(
+                                "SDK request expired or capacity reached before sending".into(),
+                            ));
+                        } else {
+                            let id = next_id;
+                            next_id += 1;
+                            send(&requests, request(id.into(), method, Some(params)))?;
+                            calls.insert(
+                                id,
+                                PendingCall {
+                                    method,
+                                    deadline,
+                                    reply,
+                                },
+                            );
+                        }
+                    }
+                    Outbound::Answer(id, result) => {
+                        if let Some(index) = interactions.iter().position(|item| item.id == id) {
+                            interactions.remove(index);
+                            send(&requests, Response::success(id, result))?;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(frame) = deliver.take() {
+            match queues.inbox.try_send(frame) {
+                Ok(()) => {}
+                Err(async_mpsc::error::TrySendError::Full(frame)) => {
+                    deliver = Some(frame);
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(async_mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
         match incoming.recv_timeout(POLL) {
             Ok(Ok(Some(Frame::Response(response)))) => {
@@ -248,25 +406,92 @@ fn exchange(
                         ));
                     }
                     ready = true;
-                    let _ = events.send(TransportState::Ready {
+                    let _ = queues.events.send(TransportState::Ready {
                         server_name: result.server_info.name,
                         server_version: Some(result.server_info.version),
                     });
                 } else if shutting_down && response.id == shutdown_id {
-                    if let Some(error) = response.error {
-                        return Err(format!("shutdown failed: {}", error.message));
-                    }
+                    response.decode_result::<Value>()?;
                     shutdown_acknowledged = true;
+                } else if let Some(call) = response.id.as_u64().and_then(|id| calls.remove(&id)) {
+                    let _ = call.reply.send(Ok(response));
                 }
                 // Drain already buffered frames before observing process exit.
                 continue;
             }
             Ok(Ok(Some(Frame::Notification(notification)))) => {
-                tracing::debug!(method = %notification.method, "SDK notification");
+                if notification.method
+                    == dsh_protocol::protocol::ServerNotification::UserQuestionCancelled.as_str()
+                {
+                    if let Some(id) = notification
+                        .params
+                        .as_ref()
+                        .and_then(|p| p["requestId"].as_str())
+                    {
+                        interactions.retain(|item| item.question.as_deref() != Some(id));
+                    }
+                }
+                deliver = Some(Inbound {
+                    frame: Frame::Notification(notification),
+                    interaction_deadline: None,
+                });
                 continue;
             }
             Ok(Ok(Some(Frame::Request(request)))) => {
-                return Err(format!("unsupported SDK host request: {}", request.method));
+                if shutting_down {
+                    deliver = Some(Inbound {
+                        frame: Frame::Request(request),
+                        interaction_deadline: None,
+                    });
+                    continue;
+                }
+                let approval = request.method == METHOD_APPROVAL_REQUEST;
+                let question = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p["requestId"].as_str());
+                let mut interaction_deadline = None;
+                if !ready || (!approval && request.method != METHOD_USER_QUESTION) {
+                    send(
+                        &requests,
+                        Response::failure(
+                            request.id.clone(),
+                            -32601,
+                            "unsupported SDK host request",
+                        ),
+                    )?;
+                } else if !approval && question.is_none() {
+                    send(
+                        &requests,
+                        Response::failure(
+                            request.id.clone(),
+                            -32602,
+                            "missing SDK question request ID",
+                        ),
+                    )?;
+                } else if interactions.len() >= RPC_LIMIT {
+                    send(
+                        &requests,
+                        Response::failure(
+                            request.id.clone(),
+                            -32603,
+                            "host interaction capacity reached",
+                        ),
+                    )?;
+                } else {
+                    let deadline = Instant::now() + INTERACTION_TIMEOUT;
+                    interactions.push(PendingInteraction {
+                        id: request.id.clone(),
+                        deadline,
+                        question: question.filter(|_| !approval).map(str::to_owned),
+                    });
+                    interaction_deadline = Some(deadline);
+                }
+                deliver = Some(Inbound {
+                    frame: Frame::Request(request),
+                    interaction_deadline,
+                });
+                continue;
             }
             Ok(Err(error)) => return Err(format!("runtime transport: {error}")),
             Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -291,6 +516,25 @@ fn exchange(
             };
         }
     }
+}
+
+struct PendingCall {
+    method: ClientMethod,
+    deadline: Instant,
+    reply: oneshot::Sender<Result<Response, String>>,
+}
+
+struct PendingInteraction {
+    id: JsonRpcId,
+    deadline: Instant,
+    question: Option<String>,
+}
+
+fn send(writer: &mpsc::SyncSender<Frame>, frame: Frame) -> Result<(), String> {
+    writer.try_send(frame).map_err(|error| match error {
+        mpsc::TrySendError::Full(_) => "SDK stdin queue saturated".into(),
+        mpsc::TrySendError::Disconnected(_) => "SDK stdin writer stopped".into(),
+    })
 }
 
 #[cfg(all(test, unix))]

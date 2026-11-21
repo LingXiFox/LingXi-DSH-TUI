@@ -34,6 +34,20 @@ fn shell(script: &str) -> Command {
     command
 }
 
+fn queues(
+    stopped: mpsc::Receiver<()>,
+    events: async_mpsc::UnboundedSender<TransportState>,
+) -> WorkerQueues {
+    let (_, outbound) = mpsc::sync_channel(QUEUE);
+    let (inbox, _) = async_mpsc::channel(QUEUE);
+    WorkerQueues {
+        stop: stopped,
+        outbound,
+        events,
+        inbox,
+    }
+}
+
 #[test]
 fn initializes_and_shuts_down_over_real_pipes() {
     let config = fixture();
@@ -42,7 +56,7 @@ fn initializes_and_shuts_down_over_real_pipes() {
     let script = format!("{READY}{SHUTDOWN}");
     let worker_config = config.clone();
     let worker =
-        thread::spawn(move || run_child(&worker_config, shell(&script), &stopped, &events));
+        thread::spawn(move || run_child(&worker_config, shell(&script), &queues(stopped, events)));
     let state = receiver.blocking_recv().unwrap();
     assert_eq!(
         state,
@@ -52,6 +66,107 @@ fn initializes_and_shuts_down_over_real_pipes() {
         }
     );
     stop.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    std::fs::remove_dir_all(config.home).unwrap();
+}
+
+#[test]
+fn correlates_out_of_order_replies_and_keeps_host_ids_separate() {
+    let config = fixture();
+    let worker_config = config.clone();
+    let (stop, stopped) = mpsc::channel();
+    let (events, mut states) = async_mpsc::unbounded_channel();
+    let (outbound, calls) = mpsc::sync_channel(QUEUE);
+    let (inbox, mut received) = async_mpsc::channel(QUEUE);
+    let worker = thread::spawn(move || {
+        let script = format!(
+            r#"{READY}
+read -r first; read -r second
+printf '%s\n' '{{"jsonrpc":"2.0","id":"req_tool","method":"approval/request","params":{{"sessionId":"s","toolName":"read"}}}}'
+read -r approval
+case "$approval" in *'"id":"req_tool"'*'"outcome":"rejected"'*) ;; *) exit 9 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{}}}}' '{{"jsonrpc":"2.0","id":3,"result":{{"messageId":"m1"}}}}'
+read -r timeout
+{SHUTDOWN}
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session.event","params":{{"sessionId":"s","event":{{"seq":7}}}}}}'"#
+        );
+        run_child(
+            &worker_config,
+            shell(&script),
+            &WorkerQueues {
+                stop: stopped,
+                outbound: calls,
+                events,
+                inbox,
+            },
+        )
+    });
+    assert!(matches!(
+        states.blocking_recv(),
+        Some(TransportState::Ready { .. })
+    ));
+    let call = |method, params, timeout| {
+        let (reply, result) = oneshot::channel();
+        assert!(
+            outbound
+                .try_send(Outbound::Call {
+                    method,
+                    params,
+                    reply,
+                    deadline: Instant::now() + timeout
+                })
+                .is_ok()
+        );
+        result
+    };
+    let normal = Duration::from_secs(3);
+    let first = call(
+        ClientMethod::SessionPrompt,
+        dsh_protocol::stdio::prompt_params("s", "hello"),
+        normal,
+    );
+    let second = call(
+        ClientMethod::SessionWait,
+        dsh_protocol::stdio::session_params("s"),
+        normal,
+    );
+    let request = received.blocking_recv().unwrap();
+    assert!(request.interaction_deadline.is_some());
+    let Frame::Request(request) = request.frame else {
+        panic!("approval request expected");
+    };
+    assert_eq!(request.id, JsonRpcId::String("req_tool".into()));
+    assert!(
+        outbound
+            .try_send(Outbound::Answer(request.id, json!({"outcome":"rejected"})))
+            .is_ok()
+    );
+    assert_eq!(
+        second.blocking_recv().unwrap().unwrap().id,
+        JsonRpcId::from(4)
+    );
+    assert_eq!(
+        first.blocking_recv().unwrap().unwrap().result.unwrap()["messageId"],
+        "m1"
+    );
+    let timed = call(
+        ClientMethod::SessionWait,
+        dsh_protocol::stdio::session_params("s"),
+        Duration::from_millis(200),
+    );
+    assert!(
+        timed
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err()
+            .contains("outcome is unknown")
+    );
+    stop.send(()).unwrap();
+    let final_frame = received.blocking_recv().unwrap();
+    let Frame::Notification(notification) = final_frame.frame else {
+        panic!("shutdown notification expected");
+    };
+    assert_eq!(notification.params.unwrap()["event"]["seq"], 7);
     worker.join().unwrap().unwrap();
     std::fs::remove_dir_all(config.home).unwrap();
 }
@@ -89,7 +204,7 @@ fn rejects_rpc_errors_noise_wrong_identity_truncation_and_early_exit() {
         let config = fixture();
         let (_stop, stopped) = mpsc::channel();
         let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let error = run_child(&config, shell(script), &stopped, &events).unwrap_err();
+        let error = run_child(&config, shell(script), &queues(stopped, events)).unwrap_err();
         assert!(
             error.contains(expected),
             "expected {expected:?}, got {error:?}"
@@ -107,8 +222,7 @@ fn cancellation_interrupts_a_pending_initialize() {
     run_child(
         &config,
         shell("read -r request; read -r next"),
-        &stopped,
-        &events,
+        &queues(stopped, events),
     )
     .unwrap();
     std::fs::remove_dir_all(config.home).unwrap();
@@ -121,7 +235,7 @@ fn initialize_timeout_interrupts_a_blocked_stdin_write() {
     let (_stop, stopped) = mpsc::channel();
     let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let start = Instant::now();
-    let error = run_child(&config, shell("kill -STOP $$"), &stopped, &events).unwrap_err();
+    let error = run_child(&config, shell("kill -STOP $$"), &queues(stopped, events)).unwrap_err();
     assert!(error.contains("initialize timed out"), "{error}");
     assert!(start.elapsed() < Duration::from_secs(2));
     std::fs::remove_dir_all(config.home).unwrap();
@@ -137,8 +251,7 @@ fn shutdown_timeout_kills_and_reaps_the_child() {
         run_child(
             &worker_config,
             shell(&format!("{READY}read -r shutdown; read -r never")),
-            &stopped,
-            &events,
+            &queues(stopped, events),
         )
     });
     assert!(matches!(

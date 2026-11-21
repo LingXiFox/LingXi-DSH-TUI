@@ -8,6 +8,8 @@
 #![deny(missing_docs)]
 
 pub mod activity;
+pub mod conversation;
+pub mod draft;
 pub mod session;
 
 pub use activity::{ActivityEntry, ActivityKind, ActivityLog};
