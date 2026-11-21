@@ -241,13 +241,19 @@ impl Question {
                 if !custom && !self.selected.iter().any(|checked| *checked) {
                     self.selected[self.focus] = true;
                 }
+                let text = if custom || self.multi {
+                    self.custom.text().trim()
+                } else {
+                    ""
+                };
                 let selected: Vec<_> = self
                     .options
                     .iter()
                     .zip(&self.selected)
-                    .filter_map(|((label, _), checked)| checked.then_some(label))
+                    .filter_map(|((label, _), checked)| {
+                        (*checked && (self.multi || text.is_empty())).then_some(label)
+                    })
                     .collect();
-                let text = self.custom.text().trim();
                 if selected.is_empty() && text.is_empty() {
                     return None;
                 }
@@ -333,6 +339,22 @@ mod tests {
             Some(
                 json!({"answers":[{"id":"one","selected":["A","B"]},{"id":"two","selected":[],"custom":"自定义"}]})
             )
+        );
+    }
+
+    #[test]
+    fn custom_answer_replaces_a_single_selected_option() {
+        let mut modal = make(
+            METHOD_USER_QUESTION,
+            json!({"requestId":"ask-2","questions":[
+                {"id":"one","question":"Select one","options":[{"label":"A"}]}
+            ]}),
+        );
+        assert!(modal.key(key(KeyCode::Char(' '))).is_none());
+        modal.paste("Custom");
+        assert_eq!(
+            modal.key(key(KeyCode::Enter)),
+            Some(json!({"answers":[{"id":"one","selected":[],"custom":"Custom"}]}))
         );
     }
 }

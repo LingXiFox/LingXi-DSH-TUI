@@ -23,6 +23,8 @@ import unicodedata
 
 ROOT = Path(__file__).resolve().parents[1]
 FILE_TEXT = "Official-runtime-read-marker"
+CHILD_PROMPT = "Return the child fixture marker."
+CHILD_REPLY = "Child fixture marker"
 ROWS, COLS = 32, 132
 ESCAPE = re.compile(r"\x1b\[([0-9;?]*)([@-~])")
 
@@ -89,6 +91,22 @@ class Provider(http.server.BaseHTTPRequestHandler):
                                  "sandbox_permissions": "danger-full-access",
                                  "justification": f"Check the approval round trip for {marker}."}}
             stop = "tool_use"
+        elif index == 8:
+            content = {"type": "tool_use", "id": "fixture-question", "name": "ask_user_question",
+                       "input": {"questions": [{"id": "fixture-choice", "question": "Pick fixture options",
+                                                "multi_select": True,
+                                                "options": [{"label": "Alpha"}, {"label": "Beta"}]}]}}
+            stop = "tool_use"
+        elif index == 10:
+            content = {"type": "tool_use", "id": "fixture-child", "name": "subagent",
+                       "input": {"description": "Check child session", "prompt": CHILD_PROMPT}}
+            stop = "tool_use"
+        elif any(message["role"] == "user" and any(
+            item.get("type") == "text" and item.get("text") == CHILD_PROMPT
+            for item in message["content"] if isinstance(item, dict)
+        ) for message in request["messages"]):
+            content = {"type": "text", "text": CHILD_REPLY}
+            stop = "end_turn"
         else:
             content = {"type": "text", "text": f"Confirmed response {index}"}
             stop = "end_turn"
@@ -142,7 +160,10 @@ def exercise(binary, root, work, server):
 
     def expect(text, *, raw=False):
         def matches():
-            return text.encode() in output if raw else text in screen_text(output)
+            if raw:
+                return text.encode() in output
+            screen = screen_text(output)
+            return text.search(screen) is not None if isinstance(text, re.Pattern) else text in screen
 
         deadline = time.monotonic() + 25
         while not matches() and time.monotonic() < deadline:
@@ -232,6 +253,28 @@ def exercise(binary, root, work, server):
         os.write(terminal, b"\r")
         expect("Confirmed response 7")
         assert allowed.read_text() == "approval-marker", "Approved tool did not run"
+
+        os.write(terminal, b"Test question\r")
+        expect("Agent question")
+        expect("Pick fixture options")
+        os.write(terminal, b" \t \tCustom fixture answer\r")
+        expect("Confirmed response 9")
+        result = next(item for message in server.requests[8]["messages"]
+                      for item in message["content"] if isinstance(item, dict)
+                      and item.get("tool_use_id") == "fixture-question")
+        assert json.loads(result["content"][0]["text"]) == {"answers": [
+            {"id": "fixture-choice", "selected": ["Alpha", "Beta"], "custom": "Custom fixture answer"}
+        ]}
+
+        os.write(terminal, b"Test child session\r")
+        child_row = re.compile(r"Subagent · (\S+) · ok")
+        expect(child_row)
+        child_id = child_row.search(screen_text(output)).group(1)
+        expect("Turn finished")
+        os.write(terminal, b"\x10")
+        expect("Commands")
+        os.write(terminal, f"/view {child_id}\r".encode())
+        expect(CHILD_REPLY)
         os.write(terminal, b"\x10")
         expect("Commands")
         os.write(terminal, b"/quit\r")
@@ -241,7 +284,7 @@ def exercise(binary, root, work, server):
         assert os.waitstatus_to_exitcode(status) == 0
         assert runtime not in process_table(), "SDK runtime was not reaped"
         print("Official SDK chat: multi-turn context, real read, fold/expand, route restart/resume, "
-              "default denial, allow once, terminal restore and process reap passed")
+              "approvals, structured question, child session, terminal restore and process reap passed")
     finally:
         if not exited:
             try:
