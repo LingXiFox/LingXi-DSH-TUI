@@ -21,7 +21,6 @@ on:
       - ".github/workflows/runtime-check.yml"
       - "scripts/build-runtime.sh"
       - "scripts/smoke-runtime.sh"
-      - "scripts/test-runtime-chat.py"
   pull_request:
     paths:
       - "runtime/**"
@@ -31,7 +30,6 @@ on:
       - ".github/workflows/runtime-check.yml"
       - "scripts/build-runtime.sh"
       - "scripts/smoke-runtime.sh"
-      - "scripts/test-runtime-chat.py"
 
 permissions:
   contents: read
@@ -85,6 +83,5 @@ jobs:
           DEEPSEEK_API_KEY: keyless-smoke-no-call
           DEEPSEEK_BASE_URL: http://127.0.0.1:9
         run: cargo run --quiet --locked -p dsh-tui -- --check-runtime
-
-      - name: Official SDK chat, tools and approvals in a terminal
-        run: python3 scripts/test-runtime-chat.py
+      # UI-dependent PTY chat test intentionally removed during the clean-slate reset.
+      # SDK initialize/shutdown remains covered above; chat UI is not ready for release.
