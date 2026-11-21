@@ -15,18 +15,22 @@ on:
       - "runtime/upstream.lock.toml"
       - "runtime/protocol-source.lock"
       - "crates/dsh-protocol/**"
+      - "crates/dsh-state/**"
       - "crates/dsh-tui/**"
       - ".github/workflows/runtime-check.yml"
       - "scripts/build-runtime.sh"
       - "scripts/smoke-runtime.sh"
+      - "scripts/test-runtime-chat.py"
   pull_request:
     paths:
       - "runtime/**"
       - "crates/dsh-protocol/**"
+      - "crates/dsh-state/**"
       - "crates/dsh-tui/**"
       - ".github/workflows/runtime-check.yml"
       - "scripts/build-runtime.sh"
       - "scripts/smoke-runtime.sh"
+      - "scripts/test-runtime-chat.py"
 
 permissions:
   contents: read
@@ -80,3 +84,6 @@ jobs:
           DEEPSEEK_API_KEY: keyless-smoke-no-call
           DEEPSEEK_BASE_URL: http://127.0.0.1:9
         run: cargo run --quiet --locked -p dsh-tui -- --check-runtime
+
+      - name: Two official SDK turns and a real read tool in a terminal
+        run: python3 scripts/test-runtime-chat.py

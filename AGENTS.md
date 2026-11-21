@@ -48,6 +48,13 @@ Data flows one way: transport frames become `dsh-protocol` types, `dsh-state`
 projects them into view state, `dsh-tui` renders that state. A renderer that
 reaches back into protocol types for anything other than display is a design smell.
 
+Use the official `sdk` profile for interactive turns. Keep the SDK approval
+bridge enabled and require explicit one-shot consent for approval requests.
+Keep inbound queues bounded and preserve received notifications and host
+requests in arrival order. Use SDK session IDs, event sequences, turn numbers,
+and tool-call IDs for projection and folding. Lay out only visible transcript
+chunks and coalesce redraws outside the receive path.
+
 ### No network at startup
 
 The client never downloads, checks for, or installs a DSH runtime at startup. The
@@ -117,7 +124,9 @@ worse than no test: it hides the gap.
   naming what is missing and why) instead of faking coverage.
 - Round-one tests cover the lock parser, version ordering, release selection, pin
   rewriting, terminal lifecycle, key mapping, layout degradation and folding.
-  Nothing in round one drives a real Agent process; that is round two.
+`python3 scripts/test-runtime-chat.py` exercises the built Agent through the TUI
+on a Unix PTY using only a loopback Provider fixture. See `docs/p2-p3.md` for the
+release-mode benchmark command and the pinned SDK limitations.
 
 ## Style
 

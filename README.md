@@ -64,9 +64,28 @@ cargo run -p dsh-tui
 
 `dsh-tui` 支持 `--version` / `--help` / `--check-runtime`。界面需要交互终端，否则以退出码 2 结束。`--check-runtime` 可在 CI 中验证初始化与正常退出，失败返回非零退出码。
 
-启动使用官方 `sdk-minimal` profile，默认路由为 `deepseek-official` / `deepseek-v4-pro`，可通过 `DSH_TUI_PROVIDER` / `DSH_TUI_MODEL` 调整。握手超时为 10 秒，退出超时为 3 秒，异常退出后界面显示原因。运行时缺失时界面进入故障状态。
+客户端启动官方 `sdk` profile，使用 `workspace-write` 权限模式。默认路由是 `deepseek-official` / `deepseek-v4-pro`，可用 `DSH_TUI_PROVIDER` 和 `DSH_TUI_MODEL` 设置。运行时通过官方配置读取凭据。工具审批默认选中拒绝，选择「允许一次」后才会放行。
 
 `DSH_TUI_ROOT` 可指定工作区或包目录。包目录也可由可执行文件位置自动识别。Agent 使用该目录下 `.dsh-tui/agent` 作为独立 `DSH_HOME`，遥测关闭。TUI 日志写入 `.dsh-tui/dsh-tui.log`，`RUST_LOG` / `DSH_TUI_LOG` 控制级别。官方运行时的 stderr 写入 `.dsh-tui/runtime.log`。
+
+### 对话和工具详情
+
+| 按键 | 操作 |
+| --- | --- |
+| Enter | 发送当前草稿 |
+| Ctrl+J / Shift+Enter | 换行。若终端无法区分 Shift+Enter，可使用 Ctrl+J 或设置 `DSH_TUI_NEWLINE=alt-enter` 后使用 Alt+Enter |
+| Shift+方向键 / Ctrl+A | 选择文本 |
+| Ctrl+P | 打开命令面板，输入命令后按 Enter |
+| Ctrl+L | 切换 Compact、Normal、Verbose |
+| Tab | 展开或折叠工具组、单个调用或子会话摘要 |
+| F6 / Esc | 切换输入与历史焦点，或关闭浮层、从子会话返回 |
+| PgUp / PgDn | 翻页。历史焦点下 End 恢复跟随最新消息 |
+| Ctrl+C | 中断当前任务并重连，空闲时退出 |
+| ? | 查看帮助 |
+
+Compact 按轮次显示工具数量与状态。Normal 按执行步骤展示调用及输出摘要。Verbose 提供参数、输出和错误的完整文本。
+
+在命令面板中，`/new` 开始新会话，`/resume ID` 恢复已知会话，`/cwd` 查询会话目录。空闲时可用 `/route PROVIDER MODEL` 重连到指定模型路由。`/failure` 跳到失败工具，`/view ID` 查看已经收到事件的子会话，`/draft` 取回发送失败的草稿，`/quit` 退出。
 
 ### 提交前必跑
 
@@ -113,43 +132,17 @@ cargo run -p dsh-protocol --bin dsh-runtime-lock -- check        # lock + 子模
 
 PR 打开或刷新后，流水线显式触发 `CI` 与 `Runtime check`。开启自动合并时，流水线等待本次触发的运行完成，并核对两次运行验证的提交。创建 PR 需要配置具有 Pull requests 写权限的 GitHub App（`SYNC_APP_ID` / `SYNC_APP_PRIVATE_KEY`），或在仓库设置允许 GitHub Actions 使用 `GITHUB_TOKEN` 创建 PR。
 
-`runtime/protocol-source.lock` 记录已审阅 SDK 协议源码的 Git blob 哈希。文件、字段、方法或传输实现变化都会使 `contract` 失败，维护者审阅 Rust 类型及测试后更新快照。导入的领域类型兼容性验证在后续会话接入时补齐。`Runtime check` 会构建官方运行时并执行真实 SDK 初始化与退出检查。
+`runtime/protocol-source.lock` 记录已审阅 SDK 协议源码的 Git blob 哈希。文件、字段、方法或传输实现变化都会使 `contract` 失败。维护者审阅 Rust 类型及测试后更新快照。`Runtime check` 构建官方运行时并通过 PTY 验证两轮对话、真实文件读取、会话恢复和进程回收。
 
 ### 发布
 
 `release.yml` 仅手动触发（`workflow_dispatch`），默认 `dry_run=true` 只打包不发布。发布前会拒绝复用已存在的 tag。上游同步**永远不会**自动触发发布。
 
-## 已实现 / 未实现
+## 当前限制
 
-### 已实现（round 1：工程基建）
+固定版本的 SDK 在消息落定后发送 `session.event`，其中可能包含打包的模型增量。逐字实时刷新、历史列表与历史正文回填需要上游接口。TUI 可按已知 ID 恢复会话，模型路由由官方 SDK 校验。中断通过 SDK `shutdown`、限时回收和重新连接实现，会影响当前进程管理的所有任务。
 
-- [x] Rust workspace（Edition 2024，三个 crate，单向数据流）
-- [x] 可运行的 Ratatui TUI：终端初始化 / 退出 / 恢复正确，降级模式可用（无 lock 文件也能起）
-- [x] 官方运行时以子模块固定在 `dsh-v0.2.2-rc.5`（`9c2670d3bce5275e0d1610272958121af87787bb`）
-- [x] 运行时锁定 + 校验工具链（`check` / `verify` / `contract` / `select` / `set`）
-- [x] 官方 SDK 线路契约镜像（8 个 client 方法、6 个 server 通知、`approval/request`），带契约测试
-- [x] 上游同步流水线（检测、升级分支、门禁、PR、失败 issue、受控 auto-merge）
-- [x] CI（fmt / clippy / test / build / 运行时锁定 / shellcheck / 守卫反向测试）
-- [x] macOS / Linux / Windows 的 Rust CI 矩阵已运行。
-- [x] 打包脚本骨架（`build-runtime.sh`、`package.sh`、`smoke-runtime.sh`）
-- [x] 版本单源 + 版本漂移守卫（含反向用例）
-
-### 已实现（round 2：运行时连接）
-
-- [x] 工作区与包目录中的官方 SDK 子进程启动，stdout 帧与 stderr 日志分流
-- [x] `initialize` 握手、SDK 身份校验、连接状态与故障原因展示
-- [x] 有界帧读取、初始化超时、退出取消、`shutdown` 请求与超时回收
-- [x] `--check-runtime` 及真实运行时 CI 握手检查
-
-### 后续任务
-
-- [ ] 会话建立、用户消息提交与 Agent 事件投影。
-- [ ] **没有对话 UI**。没有消息流、输入框、流式渲染、工具调用卡片、审批弹窗、取消。
-- [ ] **没有 Provider 配置**、模型选择、密钥管理界面。
-- [ ] **没有会话持久化界面的接入**（恢复 / 列举历史会话）。
-- [ ] **没有 release 实际产物**。`release.yml` 是结构与流程，尚未产出过发布。
-- [ ] **auto-merge 未在真实仓库验证**。逻辑已实现，需要打开仓库变量并触发一次真实同步才能证实。
-- [ ] 性能基准（长会话 / 高频事件）未建立基线。
+开发流程、基准与验收结果见 [P2/P3 开发记录](docs/p2-p3.md)。
 
 ## 许可
 
