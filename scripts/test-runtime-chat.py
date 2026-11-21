@@ -81,6 +81,14 @@ class Provider(http.server.BaseHTTPRequestHandler):
             content = {"type": "tool_use", "id": "fixture-read", "name": "read",
                        "input": {"file_path": "fixture.txt"}}
             stop = "tool_use"
+        elif index in (4, 6):
+            marker = "denied.txt" if index == 4 else "allowed.txt"
+            content = {"type": "tool_use", "id": f"fixture-approval-{index}", "name": "bash",
+                       "input": {"description": "Write a synthetic approval marker",
+                                 "command": f"printf approval-marker > {marker}",
+                                 "sandbox_permissions": "danger-full-access",
+                                 "justification": f"Check the approval round trip for {marker}."}}
+            stop = "tool_use"
         else:
             content = {"type": "text", "text": f"Confirmed response {index}"}
             stop = "end_turn"
@@ -166,6 +174,18 @@ def exercise(binary, root, work, server):
             elapsed = time.monotonic() - start
             print(f"Idle {elapsed:.2f}s: TUI {(cpu_seconds(tui) - tui_cpu) / elapsed:.2%} CPU, "
                   f"SDK {(cpu_seconds(runtime) - runtime_cpu) / elapsed:.2%} CPU, zero terminal writes")
+        if os.environ.get("DSH_TEST_LATENCY") == "1":
+            expect("Enter a prompt")
+            samples = []
+            for length in range(1, 51):
+                start = time.monotonic()
+                os.write(terminal, b"z")
+                expect("› " + "z" * length)
+                samples.append((time.monotonic() - start) * 1000)
+            os.write(terminal, b"\x01\x7f")
+            samples.sort()
+            p50, p95, p99 = (samples[(len(samples) * p + 99) // 100 - 1] for p in (50, 95, 99))
+            print(f"50 key-to-PTY updates, P50/P95/P99: {p50:.2f}/{p95:.2f}/{p99:.2f} ms")
         os.write(terminal, b"Read fixture.txt\r")
         expect("Confirmed response 2")
         expect("Turn finished")
@@ -192,6 +212,26 @@ def exercise(binary, root, work, server):
         assert len(server.requests) == 3, len(server.requests)
         assert FILE_TEXT in json.dumps(server.requests[1]), "Provider never received real read output"
         assert "Read fixture.txt" in json.dumps(server.requests[2]), "Second turn lost session context"
+
+        denied = work / "denied.txt"
+        os.write(terminal, b"Test default denial\r")
+        expect("Tool approval")
+        expect("denied.txt.")
+        assert not denied.exists(), "Tool ran before approval"
+        os.write(terminal, b"\r")
+        expect("Confirmed response 5")
+        assert not denied.exists(), "Denied tool ran"
+
+        allowed = work / "allowed.txt"
+        os.write(terminal, b"Test allow once\r")
+        expect("Tool approval")
+        expect("allowed.txt.")
+        assert not allowed.exists(), "Tool ran before approval"
+        os.write(terminal, b"\t")
+        expect("> Allow once")
+        os.write(terminal, b"\r")
+        expect("Confirmed response 7")
+        assert allowed.read_text() == "approval-marker", "Approved tool did not run"
         os.write(terminal, b"\x10")
         expect("Commands")
         os.write(terminal, b"/quit\r")
@@ -200,7 +240,8 @@ def exercise(binary, root, work, server):
         exited = True
         assert os.waitstatus_to_exitcode(status) == 0
         assert runtime not in process_table(), "SDK runtime was not reaped"
-        print("Official SDK chat: two turns, real read, fold/expand, route restart/resume, terminal restore and process reap passed")
+        print("Official SDK chat: multi-turn context, real read, fold/expand, route restart/resume, "
+              "default denial, allow once, terminal restore and process reap passed")
     finally:
         if not exited:
             try:

@@ -85,5 +85,5 @@ jobs:
           DEEPSEEK_BASE_URL: http://127.0.0.1:9
         run: cargo run --quiet --locked -p dsh-tui -- --check-runtime
 
-      - name: Two official SDK turns and a real read tool in a terminal
+      - name: Official SDK chat, tools and approvals in a terminal
         run: python3 scripts/test-runtime-chat.py
